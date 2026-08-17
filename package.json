@@ -1,0 +1,27 @@
+{
+  "name": "equity-research-platform",
+  "private": true,
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "packageManager": "pnpm@9.9.0",
+  "scripts": {
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "db:generate": "pnpm --filter web prisma:generate",
+    "db:migrate": "pnpm --filter web prisma:migrate",
+    "db:studio": "pnpm --filter web prisma:studio"
+  },
+  "devDependencies": {
+    "prettier": "3.3.3",
+    "prettier-plugin-tailwindcss": "0.6.6",
+    "turbo": "2.1.1"
+  }
+}

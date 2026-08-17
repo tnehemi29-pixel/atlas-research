@@ -1,0 +1,2727 @@
+// Prisma schema — connection + generator + the companies table.
+//
+// companies doubles as an ingest-once cache (see lib/services/companyService.ts):
+// profile/quote fields are populated on first lookup and refreshed on a TTL,
+// so repeat requests for the same ticker don't re-hit the FMP API. Financial
+// statements, historical prices, and filings remain separate models added in
+// later milestones — this table is identity + a single latest-quote snapshot.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Company {
+  id       String  @id @default(cuid())
+  ticker   String  @unique
+  name     String
+  exchange String?
+  sector   String?
+  industry String?
+  country  String?
+  logoUrl  String?
+
+  // Latest-quote snapshot — refreshed on a TTL by companyService, not a time series.
+  price          Float?
+  changePercent  Float?
+  marketCap      Float?
+  yearHigh       Float?
+  yearLow        Float?
+  beta           Float?
+  quoteUpdatedAt DateTime?
+
+  // SEC EDGAR identity + financial-data ingest bookkeeping (Milestone 3).
+  cik                String?   @unique
+  financialsSyncedAt DateTime?
+
+  // When lib/services/researchEventDetectionService.ts last ran for this
+  // company — gates lazy detection-on-view the same way financialsSyncedAt
+  // gates financial-data refresh (Milestone 11).
+  researchEventsSyncedAt DateTime?
+
+  financialPeriods         FinancialPeriod[]
+  rawFinancialFacts        RawFinancialFact[]
+  financialDataRefreshLogs FinancialDataRefreshLog[]
+  secFilings               SecFiling[]
+  earningsCalls            EarningsCall[]
+  researchReports          ResearchReport[]
+  watchlistEntries         WatchlistCompany[]
+  portfolioHoldings        PortfolioHolding[]
+  researchAlerts           ResearchAlert[]
+  researchEvents           ResearchEvent[]
+  historicalPriceBars      HistoricalPriceBar[]
+  investmentCases          InvestmentCase[]
+
+  // Milestone 14 — Data Quality, Model Audit & Research Integrity Engine.
+  dataQualityChecks DataQualityCheck[]
+  integrityIssues   ResearchIntegrityIssue[]
+  researchClaims    ResearchClaim[]
+  modelAudits       ModelAudit[]
+  auditLogEntries   AuditLogEntry[]
+  integritySnapshot IntegritySnapshot?
+
+  // Milestone 15 — Institutional Research Workspace & Collaboration Layer.
+  // Coverage/tasks/notes/meetings are workspace-scoped organizational data
+  // that POINTS AT this company; the company row itself stays exactly the
+  // shared, global, never-duplicated-per-workspace resource it always was.
+  companyCoverage  CompanyCoverage[]
+  projectCompanies ResearchProjectCompany[]
+  researchTasks    ResearchTask[]
+  researchNotes    ResearchNote[]
+  meetingCompanies MeetingCompany[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("companies")
+}
+
+// ---------------------------------------------------------------------------
+// Financial data infrastructure (Milestone 3)
+//
+// Pipeline: SEC EDGAR XBRL company facts -> lib/xbrl/normalize.ts maps
+// provider-specific tags onto standardized fields below -> lib/xbrl/validate.ts
+// sanity-checks them -> financialDataService persists them here, one row per
+// statement per fiscal period. RawFinancialFact is the provenance trail: which
+// XBRL concept, from which filing, produced each stored number.
+// ---------------------------------------------------------------------------
+
+enum FiscalPeriod {
+  FY
+  Q1
+  Q2
+  Q3
+  Q4
+}
+
+enum PeriodType {
+  ANNUAL
+  QUARTERLY
+}
+
+enum RefreshStatus {
+  SUCCESS
+  PARTIAL
+  FAILED
+}
+
+model FinancialPeriod {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  fiscalYear   Int
+  fiscalPeriod FiscalPeriod
+  // Derivable from fiscalPeriod (FY -> ANNUAL, Qn -> QUARTERLY) but stored
+  // explicitly so queries/indexes don't need to compute it.
+  periodType   PeriodType
+
+  // Duration facts (income statement, cash flow) anchor periodStart; pure
+  // instant-only periods (balance-sheet-only data, no matching duration
+  // facts) leave it null.
+  periodStart DateTime?
+  periodEnd   DateTime
+
+  filingType      String?
+  filingDate      DateTime?
+  accessionNumber String?
+
+  incomeStatement   IncomeStatement?
+  balanceSheet      BalanceSheet?
+  cashFlowStatement CashFlowStatement?
+  rawFacts          RawFinancialFact[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([companyId, fiscalYear, fiscalPeriod])
+  @@index([companyId, periodType, fiscalYear])
+  @@map("financial_periods")
+}
+
+model IncomeStatement {
+  id       String          @id @default(cuid())
+  periodId String          @unique
+  period   FinancialPeriod @relation(fields: [periodId], references: [id], onDelete: Cascade)
+
+  revenue                  Float?
+  costOfRevenue            Float?
+  grossProfit              Float?
+  operatingExpenses        Float?
+  operatingIncome          Float?
+  interestExpense          Float?
+  pretaxIncome             Float?
+  incomeTax                Float?
+  netIncome                Float?
+  eps                      Float?
+  dilutedEps               Float?
+  basicSharesOutstanding   Float?
+  dilutedSharesOutstanding Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("income_statements")
+}
+
+model BalanceSheet {
+  id       String          @id @default(cuid())
+  periodId String          @unique
+  period   FinancialPeriod @relation(fields: [periodId], references: [id], onDelete: Cascade)
+
+  cashAndEquivalents      Float?
+  shortTermInvestments    Float?
+  accountsReceivable      Float?
+  inventory               Float?
+  totalCurrentAssets      Float?
+  ppe                     Float?
+  goodwill                Float?
+  intangibleAssets        Float?
+  totalAssets             Float?
+  accountsPayable         Float?
+  shortTermDebt           Float?
+  longTermDebt            Float?
+  totalCurrentLiabilities Float?
+  totalLiabilities        Float?
+  stockholdersEquity      Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("balance_sheets")
+}
+
+model CashFlowStatement {
+  id       String          @id @default(cuid())
+  periodId String          @unique
+  period   FinancialPeriod @relation(fields: [periodId], references: [id], onDelete: Cascade)
+
+  operatingCashFlow        Float?
+  capex                    Float?
+  investingCashFlow        Float?
+  financingCashFlow        Float?
+  // Derived (operatingCashFlow - capex), not a raw XBRL concept — see
+  // lib/xbrl/normalize.ts.
+  freeCashFlow             Float?
+  depreciationAmortization Float?
+  stockBasedCompensation   Float?
+  changeInWorkingCapital   Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("cash_flow_statements")
+}
+
+// Provenance trail for every normalized number: which XBRL concept, from
+// which filing, won the tag-priority + restatement dedup for a given
+// standardized field and period. Regenerated (delete + reinsert) on every
+// refresh rather than upserted — see financialDataService — so there's no
+// DB-level uniqueness burden on a table that's always fully rebuilt.
+model RawFinancialFact {
+  id        String           @id @default(cuid())
+  companyId String
+  company   Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  periodId  String?
+  period    FinancialPeriod? @relation(fields: [periodId], references: [id], onDelete: SetNull)
+
+  standardizedField String
+  statementType     String
+  xbrlConcept       String
+  unit              String
+  value             Float
+  periodStart       DateTime?
+  periodEnd         DateTime
+  fiscalYear        Int?
+  fiscalPeriod      String?
+  form              String?
+  filedDate         DateTime?
+  accessionNumber   String?
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId, xbrlConcept])
+  @@index([periodId])
+  @@map("raw_financial_facts")
+}
+
+model FinancialDataRefreshLog {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  source       String        @default("SEC_EDGAR")
+  status       RefreshStatus
+  periodsFound Int           @default(0)
+  warnings     Json?
+  errorMessage String?
+
+  startedAt   DateTime
+  completedAt DateTime?
+
+  @@index([companyId, startedAt])
+  @@map("financial_data_refresh_logs")
+}
+
+// ---------------------------------------------------------------------------
+// SEC Filing Intelligence (Milestone 7)
+//
+// Pipeline: SEC EDGAR submissions -> SecFiling metadata (dedup on
+// companyId+accessionNumber) -> filing document retrieval ->
+// lib/sec/htmlExtraction.ts + sectionExtraction.ts + textCleaning.ts ->
+// FilingSection rows (regenerated on reprocessing, same pattern as
+// RawFinancialFact) -> lib/ai/analyzeFiling.ts, called only on request, never
+// automatically -> FilingAnalysis. FilingComparison caches "compare with
+// previous filing." AI-generated Json fields all follow the citation schema
+// in lib/ai/schema.ts: every item traces back to a FilingSection.
+// ---------------------------------------------------------------------------
+
+enum SecFilingType {
+  TEN_K
+  TEN_Q
+  EIGHT_K
+  DEF_14A
+  TWENTY_F
+  OTHER
+}
+
+enum FilingProcessingStatus {
+  PENDING
+  FETCHING
+  EXTRACTING
+  COMPLETE
+  FAILED
+}
+
+enum FilingSectionType {
+  BUSINESS
+  RISK_FACTORS
+  MDA
+  LIQUIDITY
+  MARKET_RISK
+  FINANCIAL_STATEMENTS
+  LEGAL_PROCEEDINGS
+  CONTROLS_AND_PROCEDURES
+  EIGHT_K_ITEM
+  OTHER
+}
+
+enum AnalysisStatus {
+  SUCCESS
+  FAILED
+}
+
+model SecFiling {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  filingType      SecFilingType
+  // The raw SEC form label (e.g. "10-K", "10-K/A", "8-K") — filingType buckets
+  // it into a supported category, formType preserves exactly what SEC said.
+  formType        String
+  filingDate      DateTime
+  periodEnd       DateTime?
+  accessionNumber String
+  // Filename of the primary document within the filing's own index — kept
+  // separately from secUrl so the URL can be rebuilt if SEC's path convention
+  // is ever needed again without a second network round trip.
+  primaryDocument String
+  secUrl          String
+  description     String?
+  // Comma-separated 8-K item codes (e.g. "2.02,9.01") straight from SEC's
+  // own filing-list metadata — available immediately at sync time, before
+  // the filing is ever processed, so the feed can filter/label material
+  // events and compute rule-based importance (lib/sec/importance.ts)
+  // without requiring full document processing first. Null for non-8-Ks.
+  items           String?
+
+  processingStatus FilingProcessingStatus @default(PENDING)
+  processingError  String?
+
+  sections FilingSection[]
+  analysis FilingAnalysis?
+
+  comparisonsAsCurrent      FilingComparison[]         @relation("ComparisonCurrentFiling")
+  comparisonsAsPrevious     FilingComparison[]         @relation("ComparisonPreviousFiling")
+  earningsFilingComparisons EarningsFilingComparison[]
+  researchEventSources      ResearchEventSource[]
+  investmentCaseEvidence    InvestmentCaseEvidence[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Prevents duplicate filings: SEC's own accession number is the
+  // authoritative per-company-per-filing identifier.
+  @@unique([companyId, accessionNumber])
+  @@index([companyId, filingType, filingDate])
+  @@map("sec_filings")
+}
+
+model FilingSection {
+  id       String    @id @default(cuid())
+  filingId String
+  filing   SecFiling @relation(fields: [filingId], references: [id], onDelete: Cascade)
+
+  sectionType FilingSectionType
+  // The literal heading text matched in the filing, e.g. "Item 1A. Risk Factors".
+  title       String
+  // For EIGHT_K_ITEM sections, the SEC item number, e.g. "5.02".
+  itemCode    String?
+  orderIndex  Int
+  // Slug used for in-app deep-linking from a citation to this section, e.g. "risk-factors".
+  anchor      String
+  content     String            @db.Text
+  // Length of `content`, in characters — surfaced for cost-control visibility
+  // (how much text a section would cost to send to the LLM) without needing
+  // to load the full text just to check its size.
+  charCount   Int
+
+  createdAt DateTime @default(now())
+
+  @@index([filingId, sectionType])
+  @@map("filing_sections")
+}
+
+// One current analysis per filing. Regenerating replaces it (the filing
+// itself never changes; only the model/prompt version might) rather than
+// accumulating a history — see secFilingService.analyzeFiling.
+model FilingAnalysis {
+  id       String    @id @default(cuid())
+  filingId String    @unique
+  filing   SecFiling @relation(fields: [filingId], references: [id], onDelete: Cascade)
+
+  status AnalysisStatus
+  // Which model produced this analysis, e.g. "claude-sonnet-4-5" — tracked so
+  // a later model upgrade can be identified rather than silently mixed in
+  // with older analyses.
+  model  String
+  error  String?
+
+  summary              String @db.Text
+  keyChanges           Json
+  risks                Json
+  managementCommentary Json
+  capitalAllocation    Json
+  accountingChanges    Json
+
+  inputTokens  Int?
+  outputTokens Int?
+
+  generatedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("filing_analyses")
+}
+
+model FilingComparison {
+  id String @id @default(cuid())
+
+  filingId         String
+  previousFilingId String
+  filing           SecFiling @relation("ComparisonCurrentFiling", fields: [filingId], references: [id], onDelete: Cascade)
+  previousFiling   SecFiling @relation("ComparisonPreviousFiling", fields: [previousFilingId], references: [id], onDelete: Cascade)
+
+  status AnalysisStatus
+  model  String
+  error  String?
+
+  // Deterministic — computed from stored FinancialPeriod data via
+  // lib/analytics/ratios.ts, never AI-generated (numbers are never left for
+  // an LLM to transcribe from text).
+  financialChanges Json
+
+  // AI-generated qualitative comparison — each item cites its section in
+  // both filings where applicable, per lib/ai/schema.ts.
+  newRisks                    Json
+  removedRisks                Json
+  changedLanguage             Json
+  guidanceChanges             Json
+  managementCommentaryChanges Json
+
+  generatedAt DateTime @default(now())
+
+  @@unique([filingId, previousFilingId])
+  @@map("filing_comparisons")
+}
+
+// ---------------------------------------------------------------------------
+// Earnings Call Intelligence (Milestone 8)
+//
+// Pipeline: FMP earnings-call-transcript endpoint (isolated in
+// lib/providers/fmp.ts; gracefully unavailable on plans without transcript
+// access, never fabricated) -> EarningsCall metadata (dedup on
+// companyId+fiscalYear+fiscalQuarter) -> raw Transcript -> deterministic
+// lib/earnings/transcriptParsing.ts splits it into speaker-tagged
+// TranscriptSegment rows (opening remarks / prepared remarks / Q&A) ->
+// lib/ai/analyzeEarningsCall.ts, called only on request, never automatically
+// -> EarningsAnalysis. GuidanceObservation rows hold AI-extracted low/high
+// candidates with a *deterministically* computed midpoint and change vs the
+// prior call's guidance for the same metric+period — the model is never
+// trusted to do that arithmetic itself. EarningsComparison caches "compare
+// with previous quarter"; EarningsFilingComparison caches "compare with SEC
+// filing" (cross-references Milestone 7's SecFiling). Every AI-generated
+// Json field follows the citation schema in lib/ai/earningsSchema.ts: every
+// item traces back to a TranscriptSegment via its anchor.
+// ---------------------------------------------------------------------------
+
+enum CallProcessingStatus {
+  PENDING
+  FETCHING
+  PARSING
+  COMPLETE
+  FAILED
+  // The provider was reachable but has no transcript for this call (e.g. a
+  // restricted-plan response, or the transcript genuinely doesn't exist) —
+  // distinct from FAILED, which means an unexpected error occurred.
+  UNAVAILABLE
+}
+
+enum TranscriptSectionType {
+  OPENING_REMARKS
+  PREPARED_REMARKS
+  QA
+  OTHER
+}
+
+enum SpeakerType {
+  EXECUTIVE
+  ANALYST
+  OPERATOR
+  OTHER
+}
+
+enum GuidanceMetric {
+  REVENUE
+  EPS
+  GROSS_MARGIN
+  OPERATING_MARGIN
+  CAPEX
+  OPEX
+  FREE_CASH_FLOW
+  SEGMENT_REVENUE
+  OTHER
+}
+
+enum GuidanceChangeType {
+  INCREASED
+  DECREASED
+  MAINTAINED
+  // No matching prior-call guidance for this metric+period was found to
+  // compare against — not necessarily the company's first time issuing it.
+  NEW
+}
+
+enum LanguageChangeType {
+  NEW_TOPIC
+  CHANGED_EMPHASIS
+  SIMILAR_COMMENTARY
+}
+
+model EarningsCall {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  fiscalYear           Int
+  fiscalQuarter        Int
+  periodEndDate        DateTime?
+  // When FMP reports a call date/time; null when only the fiscal period is known.
+  callDate             DateTime?
+  provider             String
+  // The provider's own transcript identifier where one exists — currently
+  // FMP has no separate ID beyond symbol+quarter+year, so this is usually null.
+  providerTranscriptId String?
+
+  processingStatus CallProcessingStatus @default(PENDING)
+  processingError  String?
+
+  transcript           Transcript?
+  analysis             EarningsAnalysis?
+  guidanceObservations GuidanceObservation[]
+
+  comparisonsAsCurrent   EarningsComparison[]       @relation("EarningsComparisonCurrentCall")
+  comparisonsAsPrevious  EarningsComparison[]       @relation("EarningsComparisonPreviousCall")
+  filingComparisons      EarningsFilingComparison[]
+  researchEventSources   ResearchEventSource[]
+  investmentCaseEvidence InvestmentCaseEvidence[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Prevents duplicate calls: one call per company per fiscal quarter.
+  @@unique([companyId, fiscalYear, fiscalQuarter])
+  @@index([companyId, fiscalYear, fiscalQuarter])
+  @@map("earnings_calls")
+}
+
+model Transcript {
+  id             String       @id @default(cuid())
+  earningsCallId String       @unique
+  earningsCall   EarningsCall @relation(fields: [earningsCallId], references: [id], onDelete: Cascade)
+
+  provider    String
+  rawContent  String   @db.Text
+  retrievedAt DateTime @default(now())
+
+  segments TranscriptSegment[]
+
+  @@map("transcripts")
+}
+
+model TranscriptSegment {
+  id           String     @id @default(cuid())
+  transcriptId String
+  transcript   Transcript @relation(fields: [transcriptId], references: [id], onDelete: Cascade)
+
+  section     TranscriptSectionType
+  orderIndex  Int
+  speakerName String?
+  speakerRole String?
+  speakerType SpeakerType
+  text        String                @db.Text
+  // Slug used for in-app deep-linking from a citation to this segment, e.g. "segment-14".
+  anchor      String
+
+  @@index([transcriptId, section])
+  @@map("transcript_segments")
+}
+
+// One current analysis per call — regenerating replaces it, same pattern as FilingAnalysis.
+model EarningsAnalysis {
+  id             String       @id @default(cuid())
+  earningsCallId String       @unique
+  earningsCall   EarningsCall @relation(fields: [earningsCallId], references: [id], onDelete: Cascade)
+
+  status AnalysisStatus
+  model  String
+  error  String?
+
+  summary              String @db.Text
+  businessTrends       Json
+  managementCommentary Json
+  risks                Json
+  capitalAllocation    Json
+  // Per-question analyst Q&A analysis (analyst, firm, topic, summaries,
+  // source excerpt) plus the deterministic topic-count rollup computed from it.
+  analystTopics        Json
+  // "AI-based language analysis" — categorical (not scored) observations per
+  // dimension (confidence/caution/uncertainty/optimism/defensiveness), each
+  // backed by a transcript excerpt. See lib/ai/earningsSchema.ts for the
+  // documented methodology this ships with.
+  managementLanguage   Json
+
+  inputTokens  Int?
+  outputTokens Int?
+
+  generatedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("earnings_analyses")
+}
+
+// AI-extracted guidance candidates. low/high (and priorLow/priorHigh) come
+// from the model reading spoken language; midpoint and change are always
+// computed in TypeScript afterward — never left for the model to calculate.
+model GuidanceObservation {
+  id             String       @id @default(cuid())
+  earningsCallId String
+  earningsCall   EarningsCall @relation(fields: [earningsCallId], references: [id], onDelete: Cascade)
+
+  metric      GuidanceMetric
+  metricLabel String
+  period      String
+
+  low      Float?
+  high     Float?
+  midpoint Float?
+
+  priorLow      Float?
+  priorHigh     Float?
+  priorMidpoint Float?
+  change        GuidanceChangeType
+
+  sourceExcerpt String  @db.Text
+  sourceAnchor  String?
+
+  createdAt DateTime @default(now())
+
+  @@index([earningsCallId, metric])
+  @@map("guidance_observations")
+}
+
+model EarningsComparison {
+  id String @id @default(cuid())
+
+  earningsCallId         String
+  previousEarningsCallId String
+  earningsCall           EarningsCall @relation("EarningsComparisonCurrentCall", fields: [earningsCallId], references: [id], onDelete: Cascade)
+  previousEarningsCall   EarningsCall @relation("EarningsComparisonPreviousCall", fields: [previousEarningsCallId], references: [id], onDelete: Cascade)
+
+  status AnalysisStatus
+  model  String
+  error  String?
+
+  // Deterministic — reuses lib/analytics/ratios.ts against Atlas's own stored
+  // FinancialPeriod data, same pattern as FilingComparison.financialChanges.
+  financialChanges Json
+
+  // AI-generated: language changes labeled New topic / Changed emphasis /
+  // Similar commentary (never "business change" without transcript support),
+  // and a tone comparison between the two calls' management language.
+  languageChanges Json
+  toneComparison  Json
+  // Deterministic rollup of GuidanceObservation deltas between the two calls
+  // (increased/decreased/maintained/new per metric) — never AI-generated.
+  guidanceSummary Json
+
+  generatedAt DateTime @default(now())
+
+  @@unique([earningsCallId, previousEarningsCallId])
+  @@map("earnings_comparisons")
+}
+
+model EarningsFilingComparison {
+  id             String       @id @default(cuid())
+  earningsCallId String
+  earningsCall   EarningsCall @relation(fields: [earningsCallId], references: [id], onDelete: Cascade)
+  secFilingId    String
+  secFiling      SecFiling    @relation(fields: [secFilingId], references: [id], onDelete: Cascade)
+
+  status AnalysisStatus
+  model  String
+  error  String?
+
+  // Every item uses neutral framing ("Potential difference in emphasis") —
+  // never "management is contradicting the filing" — per lib/ai/earningsSchema.ts.
+  alignments              Json
+  newInCall               Json
+  onlyInFiling            Json
+  riskEmphasisDifferences Json
+  guidanceDifferences     Json
+
+  generatedAt DateTime @default(now())
+
+  @@unique([earningsCallId, secFilingId])
+  @@map("earnings_filing_comparisons")
+}
+
+// ---------------------------------------------------------------------------
+// AI Equity Research Report Generator (Milestone 9)
+//
+// Pipeline: lib/research/aggregateResearchContext.ts reads ONLY already-
+// stored/computed data from every prior milestone (company profile,
+// financial statements, the DCF and comps engines run fresh — both are pure
+// functions, never persisted elsewhere — SEC filing analysis, earnings-call
+// analysis) and builds two things: a normalized ResearchContext and a
+// backend-owned Source[] registry with stable numeric IDs. Only that context
+// (never raw DB rows) goes to lib/ai/generateResearchReport.ts, which asks
+// the model for narrative text ONLY — every numeric figure in the stored
+// report (financial performance, DCF/comps output, scenario values) is
+// computed deterministically and merged in server-side, never touched by the
+// model. Every AI-generated claim cites `source_ids` into the pre-built
+// registry; any ID the model invents is stripped before storage — the
+// backend injects valid sources, it never trusts the model's own citations.
+// A report is never overwritten: regenerating creates a new `version` row,
+// so past research can always be compared against a current run.
+// ---------------------------------------------------------------------------
+
+model ResearchReport {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  // Milestone 15 — optional link into a workspace's ResearchProject for
+  // organizational purposes. The report ROW itself stays exactly as global
+  // as Milestone 9 designed it (any authenticated user can read it); a
+  // project link never restricts who can see the report, only which
+  // workspace's review workflow governs it.
+  projectId String?
+  project   ResearchProject? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  // The formal review-workflow stage (spec section 9) — deliberately a
+  // SEPARATE field from `status` below, which answers "did generation
+  // succeed," not "has this been reviewed." A FAILED-generation report can
+  // never be submitted for review (enforced in researchReviewService.ts).
+  reviewStatus ReportReviewStatus @default(DRAFT)
+  reviews      ResearchReview[]
+
+  // Incrementing per company, starting at 1 — never reused, never overwritten.
+  version Int
+
+  status AnalysisStatus
+  model  String
+  error  String?
+
+  // When the underlying research inputs (financials/filings/calls) were
+  // read to build this report — the "Research data through: [date]"
+  // freshness banner is derived from this, not from `createdAt`.
+  dataSnapshotAt DateTime
+
+  // The full structured report: deterministic numeric blocks (company
+  // overview, financial performance, valuation, DCF, comps, scenarios, key
+  // metrics) merged with AI-generated narrative (executive summary, growth
+  // drivers, SEC/earnings insights, catalysts, risks, conclusion) and the
+  // backend-built sources registry. See lib/research/types.ts for the exact
+  // shape this Json column holds.
+  content Json
+
+  inputTokens  Int?
+  outputTokens Int?
+
+  savedBy              SavedReport[]
+  researchEventSources ResearchEventSource[]
+  thesisAssumptions    ThesisAssumption[]
+  claims               ResearchClaim[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([companyId, version])
+  @@index([companyId, createdAt])
+  @@index([projectId])
+  @@index([reviewStatus])
+  @@map("research_reports")
+}
+
+// ---------------------------------------------------------------------------
+// Portfolio & Watchlist Intelligence (Milestone 10)
+//
+// A research- and portfolio-monitoring layer on top of Milestones 1-9 —
+// explicitly NOT a trading platform: no brokerage connections, no order
+// execution, no automated/buy-sell recommendations anywhere in this schema.
+// Every model below is either private per-user state (a watchlist, a
+// holding, an alert) or a thin join onto data Milestones 1-9 already own
+// (SavedReport -> ResearchReport, WatchlistCompany/PortfolioHolding ->
+// Company) — company financials, filings, calls, and reports themselves
+// stay exactly where they were: shared, global, never duplicated per user.
+//
+// Authentication is a lightweight, dependency-free design matching this
+// codebase's existing style (hand-rolled pipelines, no heavy frameworks):
+// passwords hashed with Node's built-in scrypt (lib/auth/password.ts), and
+// sessions are a random opaque token whose SHA-256 hash (never the raw
+// token) is what's stored in `Session.tokenHash` — a leaked database dump
+// alone can never be replayed as a valid session, the same "never trust
+// what's stored, verify against ownership" discipline used everywhere else
+// in this codebase (e.g. Milestone 9's source-ID validation).
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String  @id @default(cuid())
+  email        String  @unique
+  passwordHash String
+  name         String?
+
+  sessions            Session[]
+  watchlists          Watchlist[]
+  portfolios          Portfolio[]
+  alerts              ResearchAlert[]
+  savedReports        SavedReport[]
+  preferences         UserPreferences?
+  researchEventStates UserResearchEventState[]
+  investmentCases     InvestmentCase[]
+
+  // Milestone 15 — Institutional Research Workspace & Collaboration Layer.
+  createdWorkspaces       Workspace[]
+  workspaceMemberships    WorkspaceMember[]
+  companyCoverage         CompanyCoverage[]
+  ownedProjects           ResearchProject[]
+  projectMemberships      ResearchProjectMember[]
+  assignedTasks           ResearchTask[]            @relation("TaskAssignee")
+  createdTasks            ResearchTask[]            @relation("TaskCreator")
+  researchNotes           ResearchNote[]
+  researchComments        ResearchComment[]
+  requestedReviews        ResearchReview[]          @relation("ReviewRequester")
+  assignedReviews         ResearchReview[]          @relation("ReviewReviewer")
+  approvedReviews         ResearchReview[]          @relation("ReviewApprover")
+  checkedChecklistItems   ReviewChecklistItem[]
+  sectionComments         ReviewSectionComment[]    @relation("SectionCommentAuthor")
+  resolvedSectionComments ReviewSectionComment[]    @relation("SectionCommentResolver")
+  createdMeetings         ResearchMeeting[]
+  meetingParticipations   MeetingParticipant[]
+  meetingActionItems      MeetingActionItem[]
+  committeeReactions      CommitteeReviewReaction[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")
+}
+
+model Session {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // SHA-256 hex digest of the actual session cookie value — the raw token
+  // is never persisted, matching the password-hashing discipline above.
+  tokenHash String   @unique
+  expiresAt DateTime
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+// Per-user tunables the research-status/alert-evaluation logic reads (e.g.
+// "how many days old counts as stale research") — separated from User
+// itself so adding more preferences later never touches the auth-critical
+// User row.
+model UserPreferences {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  staleResearchDays Int @default(45)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("user_preferences")
+}
+
+model Watchlist {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name String
+
+  companies WatchlistCompany[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, name])
+  @@index([userId])
+  @@map("watchlists")
+}
+
+model WatchlistCompany {
+  id          String    @id @default(cuid())
+  watchlistId String
+  watchlist   Watchlist @relation(fields: [watchlistId], references: [id], onDelete: Cascade)
+  companyId   String
+  company     Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  // User-controlled display order — reordering only ever updates this
+  // integer, never the underlying Company row.
+  orderIndex Int
+
+  addedAt DateTime @default(now())
+
+  @@unique([watchlistId, companyId])
+  @@index([watchlistId, orderIndex])
+  @@map("watchlist_companies")
+}
+
+model Portfolio {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name String
+
+  holdings PortfolioHolding[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, name])
+  @@index([userId])
+  @@map("portfolios")
+}
+
+// One row per (portfolio, company) position — manual tracking only, no
+// brokerage sync. Multiple purchases of the same company are represented by
+// the user editing shares/averageCost directly (a weighted-average blend
+// they control), not by a separate lot-tracking model — see the README's
+// Known Limitations for why a full transaction ledger was deliberately not
+// built for this milestone.
+model PortfolioHolding {
+  id          String    @id @default(cuid())
+  portfolioId String
+  portfolio   Portfolio @relation(fields: [portfolioId], references: [id], onDelete: Cascade)
+  companyId   String
+  company     Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  shares       Float
+  averageCost  Float
+  purchaseDate DateTime?
+  notes        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([portfolioId, companyId])
+  @@index([portfolioId])
+  @@map("portfolio_holdings")
+}
+
+// Deliberately excludes any price-based/trading alert type — "the emphasis
+// is research monitoring," per the milestone spec. thresholdPercent is only
+// meaningful for DCF_VALUATION_CHANGE; every other type is a plain on/off
+// research-event watch. The three *_RESEARCH_EVENT/RISK types (Milestone 11)
+// are evaluated against persisted ResearchEvent rows rather than re-deriving
+// state on every check, unlike the original five (still supported for
+// backward compatibility with Milestone 10 configurations).
+enum AlertType {
+  NEW_SEC_FILING
+  EARNINGS_AVAILABLE
+  DCF_VALUATION_CHANGE
+  RESEARCH_REPORT_UPDATED
+  GUIDANCE_CHANGED
+  HIGH_IMPORTANCE_RESEARCH_EVENT
+  CRITICAL_RESEARCH_EVENT
+  NEW_MATERIAL_RISK
+  // Milestone 14 — deliberately few, high-value alert types. Spec section 25:
+  // "Do not alert for every minor issue" — MEDIUM/LOW-severity integrity
+  // issues never generate an alert, only these.
+  CRITICAL_INTEGRITY_ISSUE
+  RESEARCH_DATA_MISMATCH
+  DCF_MODEL_ERROR
+  THESIS_ASSUMPTION_CONFLICT
+}
+
+model ResearchAlert {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type AlertType
+
+  // Null = evaluated against every company across the user's watchlists and
+  // portfolio; set = scoped to one company.
+  companyId String?
+  company   Company? @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  thresholdPercent Float?
+
+  isActive Boolean @default(true)
+
+  // No background job queue exists in this codebase (matching Milestones
+  // 7-9's own documented limitation) — alerts are evaluated on demand
+  // (visiting /alerts or GET /api/alerts) rather than pushed asynchronously.
+  // These fields record the most recent on-demand evaluation.
+  lastCheckedAt        DateTime?
+  lastTriggeredAt      DateTime?
+  lastTriggeredSummary String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@map("research_alerts")
+}
+
+// A user's private bookmark onto a shared, global ResearchReport version —
+// the report content itself is never copied or made user-specific, only
+// this pointer is.
+model SavedReport {
+  id               String         @id @default(cuid())
+  userId           String
+  user             User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  researchReportId String
+  researchReport   ResearchReport @relation(fields: [researchReportId], references: [id], onDelete: Cascade)
+
+  savedAt DateTime @default(now())
+
+  @@unique([userId, researchReportId])
+  @@index([userId])
+  @@map("saved_reports")
+}
+
+// ---------------------------------------------------------------------------
+// Automated Research Change Detection & Intelligence Feed (Milestone 11)
+//
+// Pipeline: lib/services/researchEventDetectionService.ts compares a
+// company's CURRENT state (latest financial period, latest guidance, a
+// fresh DCF/comps run, the latest SEC filing, the latest earnings call, the
+// latest ResearchReport version) against its PREVIOUSLY KNOWN state — every
+// comparison is deterministic (lib/researchEvents/changeDetection.ts),
+// reusing lib/analytics/ratios.ts and the same DCF/comps engines Milestones
+// 5/6/9/10 already call. A change that clears the centralized materiality
+// thresholds (lib/researchEvents/materialityConfig.ts) becomes a
+// ResearchEvent; below-threshold changes are simply not created (not
+// stored-but-hidden — "do not spam users with every minor filing").
+//
+// A ResearchEvent is GLOBAL (shared by every user who follows the company,
+// exactly like Company/ResearchReport) — only UserResearchEventState (read/
+// unread) is private. Deduplication happens via `dedupeKey`: the same
+// underlying event surfacing through multiple sources (a guidance change
+// visible in both the earnings call's GuidanceObservation and a later
+// 10-Q) resolves to the SAME event row (`@@unique([companyId, dedupeKey])`)
+// with an additional ResearchEventSource appended, never a duplicate event.
+//
+// AI (lib/ai/explainResearchEvent.ts) only runs for events at/above the
+// configured materiality threshold, and only ever produces narrative text —
+// `aiSummary`/`aiWhyItMatters`/`aiQuestionsToInvestigate` — never a number:
+// every actual figure lives in ResearchEventChange, computed before the AI
+// is ever called. If the AI call fails, `aiStatus` records FAILED and the
+// event remains fully visible with its deterministic changes/sources intact
+// — "AI failure must never remove a source-backed research event."
+// ---------------------------------------------------------------------------
+
+enum ResearchEventCategory {
+  SEC_FILING
+  EARNINGS
+  FINANCIAL
+  VALUATION
+  CORPORATE_EVENT
+}
+
+enum ResearchEventType {
+  NEW_FILING
+  FINANCIAL_CHANGE
+  MARGIN_CHANGE
+  GUIDANCE_CHANGE
+  DCF_VALUATION_CHANGE
+  COMPS_VALUATION_CHANGE
+  NEW_RESEARCH_REPORT
+  RESEARCH_REPORT_UPDATED
+  NEW_RISK
+  CORPORATE_EVENT
+  EARNINGS_CALL
+}
+
+enum MaterialityLevel {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum ConfidenceLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+// The spec's own vocabulary for "which part of the existing research might
+// this touch" — deliberately a fixed enum, not free text, so impact notes
+// stay structured and filterable.
+enum ResearchArea {
+  FINANCIALS
+  GROWTH
+  MARGINS
+  DCF
+  COMPS
+  RISKS
+  CATALYSTS
+  MANAGEMENT
+  CAPITAL_ALLOCATION
+  INVESTMENT_THESIS
+}
+
+enum ResearchEventSourceType {
+  SEC_FILING
+  EARNINGS_CALL
+  FINANCIAL_DATA
+  VALUATION
+  RESEARCH_REPORT
+}
+
+model ResearchEvent {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  category ResearchEventCategory
+  type     ResearchEventType
+
+  title       String
+  description String @db.Text
+
+  materiality MaterialityLevel
+  confidence  ConfidenceLevel
+
+  // Stable per-conceptual-event identity, e.g. "guidance:Revenue:Q3 2026" or
+  // "filing:0000320193-26-000073" — the detection engine upserts on this
+  // rather than ever inserting blindly, which is what makes re-running
+  // detection idempotent and what makes cross-source deduplication work.
+  dedupeKey String
+
+  // When the underlying thing actually happened (filing date, call date,
+  // fiscal period end) — distinct from `detectedAt`, when Atlas's engine
+  // found it, which can lag the real event by however long the lazy
+  // on-view detection took to run.
+  eventDate  DateTime
+  detectedAt DateTime @default(now())
+
+  // AI narrative — optional, attempted only at/above the configured
+  // materiality threshold; never the source of any number. `aiAffectedResearchAreas`
+  // is the model's OWN read of which areas matter (validated against the
+  // ResearchArea enum, so it can never invent one) — kept distinct from the
+  // `impacts` relation below, which is always deterministically populated
+  // regardless of whether the AI ever runs or succeeds.
+  aiStatus                 AnalysisStatus?
+  aiModel                  String?
+  aiSummary                String?          @db.Text
+  aiWhyItMatters           String?          @db.Text
+  aiAffectedResearchAreas  Json?
+  aiQuestionsToInvestigate Json?
+  aiConfidence             ConfidenceLevel?
+  aiError                  String?
+  aiInputTokens            Int?
+  aiOutputTokens           Int?
+
+  sources                ResearchEventSource[]
+  changes                ResearchEventChange[]
+  impacts                ResearchEventImpact[]
+  userStates             UserResearchEventState[]
+  assumptionComparisons  AssumptionComparison[]
+  investmentCaseEvidence InvestmentCaseEvidence[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([companyId, dedupeKey])
+  @@index([companyId, eventDate])
+  @@index([materiality])
+  @@map("research_events")
+}
+
+// Every source is a pointer into an existing Milestone 7/8/9 record — never
+// a free-floating claim. "Never allow AI-generated events without a valid
+// source" is enforced structurally: at least one ResearchEventSource is
+// created in the same transaction as the ResearchEvent itself.
+model ResearchEventSource {
+  id      String        @id @default(cuid())
+  eventId String
+  event   ResearchEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  type  ResearchEventSourceType
+  label String
+
+  secFilingId      String?
+  earningsCallId   String?
+  researchReportId String?
+
+  secFiling      SecFiling?      @relation(fields: [secFilingId], references: [id], onDelete: SetNull)
+  earningsCall   EarningsCall?   @relation(fields: [earningsCallId], references: [id], onDelete: SetNull)
+  researchReport ResearchReport? @relation(fields: [researchReportId], references: [id], onDelete: SetNull)
+
+  detail String?
+
+  createdAt DateTime @default(now())
+
+  @@index([eventId])
+  @@map("research_event_sources")
+}
+
+// The actual numbers — every one computed deterministically by
+// lib/researchEvents/changeDetection.ts before the event is created, never
+// touched by the AI. `unit` disambiguates how `changeAbsolute`/
+// `changePercent` should be read (a margin's "change" is basis points, a
+// dollar figure's is a percent).
+model ResearchEventChange {
+  id      String        @id @default(cuid())
+  eventId String
+  event   ResearchEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  metric String
+  unit   String
+
+  previousValue  Float?
+  currentValue   Float?
+  changeAbsolute Float?
+  changePercent  Float?
+
+  createdAt DateTime @default(now())
+
+  @@index([eventId])
+  @@map("research_event_changes")
+}
+
+// "Potentially affects DCF revenue assumptions" — never "DCF assumptions
+// changed." One row per affected area per event; `note` is always
+// deterministic rule-based text (lib/researchEvents/impactMapping.ts), the
+// AI's own `aiQuestionsToInvestigate`/`aiWhyItMatters` are a separate,
+// clearly-optional narrative layer on the parent event.
+model ResearchEventImpact {
+  id      String        @id @default(cuid())
+  eventId String
+  event   ResearchEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  area ResearchArea
+  note String       @db.Text
+
+  createdAt DateTime @default(now())
+
+  @@unique([eventId, area])
+  @@index([eventId])
+  @@map("research_event_impacts")
+}
+
+// Read/unread is the ONLY per-user state for an otherwise-global event —
+// never mark an event read for every user, per the milestone spec.
+model UserResearchEventState {
+  id      String        @id @default(cuid())
+  userId  String
+  user    User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  eventId String
+  event   ResearchEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  isRead Boolean   @default(false)
+  readAt DateTime?
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, eventId])
+  @@index([userId])
+  @@map("user_research_event_states")
+}
+
+enum AssumptionKey {
+  REVENUE_CAGR
+  OPERATING_MARGIN
+  FCF_MARGIN
+  WACC
+  TERMINAL_GROWTH
+  EXIT_MULTIPLE
+  REVENUE_GUIDANCE
+}
+
+// Structurally-extracted assumptions from a saved ResearchReport's own
+// already-computed DCF Base case / latest guidance — never invented, never
+// re-derived by an LLM. One row per assumption per report version, so
+// comparing "the thesis" against new data always means comparing against
+// exactly what that report version actually assumed.
+model ThesisAssumption {
+  id               String         @id @default(cuid())
+  researchReportId String
+  researchReport   ResearchReport @relation(fields: [researchReportId], references: [id], onDelete: Cascade)
+
+  key   AssumptionKey
+  label String
+  value Float
+  unit  String
+
+  // e.g. "DCF Base case" or "Latest earnings-call guidance" — where this
+  // number actually came from, so a comparison can always be traced back.
+  extractedFrom String
+
+  comparisons AssumptionComparison[]
+
+  createdAt DateTime @default(now())
+
+  @@unique([researchReportId, key])
+  @@index([researchReportId])
+  @@map("thesis_assumptions")
+}
+
+// "Potentially inconsistent with a prior research assumption" — never
+// "thesis broken." `researchEventId` is nullable because a comparison can
+// be run standalone (comparing against the latest data even without a
+// specific triggering event); when it IS tied to an event, the comparison
+// inherits that event's own sourcing.
+model AssumptionComparison {
+  id           String           @id @default(cuid())
+  assumptionId String
+  assumption   ThesisAssumption @relation(fields: [assumptionId], references: [id], onDelete: Cascade)
+
+  researchEventId String?
+  researchEvent   ResearchEvent? @relation(fields: [researchEventId], references: [id], onDelete: SetNull)
+
+  newValue           Float
+  previousValue      Float
+  differenceAbsolute Float
+  differencePercent  Float?
+
+  flagged Boolean
+  note    String  @db.Text
+
+  createdAt DateTime @default(now())
+
+  @@index([assumptionId])
+  @@map("assumption_comparisons")
+}
+
+// ---------------------------------------------------------------------------
+// Historical Backtesting & Research Validation Engine (Milestone 12)
+//
+// The ONE new piece of persisted external data this milestone needs: a
+// growing daily-price cache, fetched and backfilled incrementally from a
+// market-data provider (lib/providers/marketData/), never re-fetched for a
+// date range Atlas already has. Every other "historical" concept in this
+// milestone — point-in-time financial snapshots, point-in-time DCF runs,
+// event studies — is computed on demand from data Milestones 1-11 already
+// store (financial periods, filings, earnings calls, research events),
+// filtered to what would have been knowable as of a given historical date.
+// See lib/backtest/pointInTimeValuation.ts and
+// lib/services/historicalSnapshotService.ts for that filtering logic, and
+// docs/backtesting.md for the full no-look-ahead-bias methodology.
+//
+// Deliberately NOT modeled here: a persisted "backtest run" or "snapshot"
+// table. Every analysis in this milestone (valuation validation, DCF
+// forecast validation, financial-signal validation, event studies,
+// valuation-spread analysis) is stateless and computed fresh per request —
+// the same "compute don't materialize" philosophy Milestone 10's research
+// feed and Milestone 11's company timeline already use, since there is no
+// background job queue in this codebase to keep a materialized result set
+// fresh. Re-running the same analysis is always idempotent and always
+// reflects the latest cached prices.
+// ---------------------------------------------------------------------------
+
+// One row per company per trading day. `close` is the single required
+// field every downstream calculation actually needs (forward returns, event
+// studies); `adjClose`/`open`/`high`/`low`/`volume` are optionally populated
+// when the provider supplies them but are never required to be non-null —
+// a provider that only returns unadjusted closes still produces a usable
+// (if slightly less precise, and documented as such) cache.
+model HistoricalPriceBar {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  date     DateTime
+  close    Float
+  adjClose Float?
+  open     Float?
+  high     Float?
+  low      Float?
+  volume   Float?
+
+  // Which market-data provider produced this row — kept even though only
+  // one provider (FMP) is wired up today, because lib/providers/marketData/
+  // is an explicit abstraction over "some provider," not FMP specifically;
+  // a second provider's rows can coexist without ambiguity about origin.
+  source String
+
+  createdAt DateTime @default(now())
+
+  @@unique([companyId, date])
+  @@index([companyId, date])
+  @@map("historical_price_bars")
+}
+
+// ---------------------------------------------------------------------------
+// Investment Committee Research & Decision Framework (Milestone 13)
+//
+// An organizational layer over Milestones 1-12 — explicitly NOT a black-box
+// stock picker. An InvestmentCase never stores a final buy/sell decision;
+// DecisionStatus values are user-assigned states describing where a case
+// sits in a research workflow, and the AI is never the one that sets them.
+// Valuation is deliberately NOT duplicated here: Bull/Base/Bear figures are
+// always recomputed live from lib/valuation/quickValuation.ts's
+// getQuickDcfScenarios (Milestone 5's engine, unchanged) and getQuickComps
+// (Milestone 6), the same "current state, always fresh" discipline every
+// prior milestone's live reads use — InvestmentCaseVersion is the ONE place
+// a valuation snapshot is deliberately frozen, and only at the moment a
+// memo is generated or a review is completed, for versioning/diffing.
+//
+// Every InvestmentCaseEvidence row must resolve to a real Atlas source: for
+// SEC filings, earnings calls, and research events, that's an actual
+// foreign key (secFilingId/earningsCallId/researchEventId) enforced at the
+// database level, not just a free-text label — see
+// lib/investmentCase/evidenceValidation.ts. The same validation path is
+// used whether a human or the AI assistant proposes the evidence; there is
+// no separate, less-checked write path for AI-originated content anywhere
+// in this milestone.
+// ---------------------------------------------------------------------------
+
+enum InvestmentCaseStatus {
+  RESEARCHING
+  WATCHLIST
+  ACTIVE_THESIS
+  UNDER_REVIEW
+  THESIS_CHALLENGED
+  THESIS_INVALIDATED
+  ARCHIVED
+}
+
+enum InvestmentScenario {
+  BULL
+  BASE
+  BEAR
+}
+
+// The full metric list spec section 4 requires, deliberately broader than
+// Milestone 11's own AssumptionKey enum (which only covers what that
+// milestone's live-comparison sources could feed) — this milestone tracks
+// a case's own user-set assumptions independent of any one ResearchReport.
+enum InvestmentAssumptionMetric {
+  REVENUE_GROWTH
+  REVENUE_CAGR
+  OPERATING_MARGIN
+  FCF_MARGIN
+  WACC
+  TERMINAL_GROWTH
+  EXIT_MULTIPLE
+  EPS_GROWTH
+  DEBT
+  SHARE_COUNT
+}
+
+enum ContentOrigin {
+  USER
+  AI
+}
+
+enum EvidenceDirection {
+  SUPPORTS
+  CONTRADICTS
+  NEUTRAL
+}
+
+enum EvidenceSourceType {
+  TEN_K
+  TEN_Q
+  EIGHT_K
+  EARNINGS_CALL
+  FINANCIAL_STATEMENT
+  DCF
+  COMPS
+  HISTORICAL_VALIDATION
+  RESEARCH_EVENT
+}
+
+enum CatalystStatus {
+  UPCOMING
+  IN_PROGRESS
+  OCCURRED
+  FAILED
+  UNCERTAIN
+}
+
+enum RiskStatus {
+  MONITORING
+  ESCALATING
+  MITIGATED
+  REALIZED
+}
+
+enum InvalidationComparator {
+  LESS_THAN
+  LESS_THAN_OR_EQUAL
+  GREATER_THAN
+  GREATER_THAN_OR_EQUAL
+}
+
+// ACTIVE = user has not reviewed this criterion against live data yet (or
+// live data doesn't currently meet it); POTENTIALLY_MET is never set by the
+// system automatically — lib/investmentCase/invalidationMonitor.ts only ever
+// returns an advisory "potentially met" evaluation in an API response, it
+// never writes this field. RESOLVED means the user reviewed a
+// potentially-met criterion and explicitly decided how to handle it.
+enum InvalidationCriterionStatus {
+  ACTIVE
+  POTENTIALLY_MET
+  RESOLVED
+}
+
+enum ReviewType {
+  QUARTERLY
+  AD_HOC
+}
+
+// Null until the user completes the review's confirmation step (spec
+// section 14) — a review can exist in an unconfirmed, in-progress state.
+enum ReviewOutcome {
+  THESIS_VALID
+  NEEDS_MODIFICATION
+  INVALIDATED
+  CONTINUE_MONITORING
+}
+
+model InvestmentCase {
+  id        String  @id @default(cuid())
+  userId    String
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  // Milestone 15 — optional link into a workspace's ResearchProject, purely
+  // organizational. InvestmentCase remains PRIVATE, per-user data exactly as
+  // Milestone 13 designed it (see the header comment above) — linking it to
+  // a project never grants other workspace members read access; only the
+  // explicit "submit to committee review" action below does that, and only
+  // for that one case.
+  projectId String?
+  project   ResearchProject? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  // Spec section 20 — Investment Committee Review is an explicit, narrow
+  // exception to the case's normal per-user privacy: the OWNER submits one
+  // case at a time to make it visible (read-only, plus reactions) to their
+  // workspace peers. Never automatic, never bulk, never inferred from status.
+  committeeReviewStatus CommitteeReviewStatus     @default(NOT_SUBMITTED)
+  committeeSubmittedAt  DateTime?
+  committeeReactions    CommitteeReviewReaction[]
+
+  // Free text on purpose (spec's own example: "3-5 years") — not every
+  // horizon fits a fixed enum.
+  horizon String
+
+  status InvestmentCaseStatus @default(RESEARCHING)
+
+  // Structured thesis editor (spec section 3) — every component its own
+  // field/column, never one unstructured blob.
+  coreThesis String   @db.Text
+  keyDrivers String[]
+
+  // Optional short scenario narratives — the actual Bull/Base/Bear NUMBERS
+  // are never stored here; they're always a live DCF/comps read (see the
+  // header comment above).
+  bullSummary String? @db.Text
+  baseSummary String? @db.Text
+  bearSummary String? @db.Text
+
+  // "What would change my mind?" (spec section 20) — one of the most
+  // important sections per the spec itself, kept as first-class structured
+  // lists rather than buried in the thesis text.
+  strengthenIndicators String[]
+  weakenIndicators     String[]
+  // Invalidation criteria have their OWN model below (with optional
+  // machine-checkable fields); these are the free-text "what would
+  // invalidate it" bullets shown alongside them in the UI.
+  invalidateIndicators String[]
+
+  assumptions          InvestmentCaseAssumption[]
+  evidence             InvestmentCaseEvidence[]
+  risks                InvestmentCaseRisk[]
+  catalysts            InvestmentCaseCatalyst[]
+  invalidationCriteria InvestmentCaseInvalidationCriterion[]
+  reviews              InvestmentCaseReview[]
+  versions             InvestmentCaseVersion[]
+  memos                InvestmentMemo[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, status])
+  @@index([userId, companyId])
+  @@index([projectId])
+  @@map("investment_cases")
+}
+
+model InvestmentCaseAssumption {
+  id               String         @id @default(cuid())
+  investmentCaseId String
+  investmentCase   InvestmentCase @relation(fields: [investmentCaseId], references: [id], onDelete: Cascade)
+
+  metric   InvestmentAssumptionMetric
+  scenario InvestmentScenario         @default(BASE)
+  value    Float
+  unit     String
+
+  asOfDate DateTime
+  // Free text — e.g. "DCF Model", "Management guidance", "User estimate".
+  source   String
+  // Optional pointer to which underlying model/report this ties back to,
+  // e.g. "DCF Base case" — distinct from `source`, which is more general.
+  model    String?
+
+  confidence ConfidenceLevel @default(MEDIUM)
+  origin     ContentOrigin   @default(USER)
+  notes      String?         @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([investmentCaseId, metric, scenario])
+  @@index([investmentCaseId])
+  @@map("investment_case_assumptions")
+}
+
+model InvestmentCaseEvidence {
+  id               String         @id @default(cuid())
+  investmentCaseId String
+  investmentCase   InvestmentCase @relation(fields: [investmentCaseId], references: [id], onDelete: Cascade)
+
+  claim    String   @db.Text
+  evidence String   @db.Text
+  date     DateTime
+  // Free text label, e.g. "Growth", "Margins", "Competition" — not a fixed
+  // enum, since the space of research categories is genuinely open-ended.
+  category String
+
+  direction EvidenceDirection
+  strength  ConfidenceLevel
+
+  sourceType  EvidenceSourceType
+  // Always required, regardless of sourceType — a human-readable citation
+  // even for the three row-backed types below, and the ONLY citation for
+  // the three non-row-backed types (FINANCIAL_STATEMENT/DCF/COMPS/
+  // HISTORICAL_VALIDATION have no single persisted row to point a foreign
+  // key at).
+  sourceLabel String
+
+  // Real foreign keys for the three source types Atlas actually persists as
+  // rows — set together with sourceType (never both null and a row-backed
+  // sourceType) and validated at write time by
+  // lib/investmentCase/evidenceValidation.ts before the row is ever created.
+  secFilingId String?
+  secFiling   SecFiling? @relation(fields: [secFilingId], references: [id], onDelete: SetNull)
+
+  earningsCallId String?
+  earningsCall   EarningsCall? @relation(fields: [earningsCallId], references: [id], onDelete: SetNull)
+
+  researchEventId String?
+  researchEvent   ResearchEvent? @relation(fields: [researchEventId], references: [id], onDelete: SetNull)
+
+  origin ContentOrigin @default(USER)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([investmentCaseId, direction])
+  @@map("investment_case_evidence")
+}
+
+model InvestmentCaseRisk {
+  id               String         @id @default(cuid())
+  investmentCaseId String
+  investmentCase   InvestmentCase @relation(fields: [investmentCaseId], references: [id], onDelete: Cascade)
+
+  risk        String           @db.Text
+  // Nullable — a probability assessment is only ever stored when the user
+  // actually provides one (spec section 19: never assign a number/tier
+  // without a documented basis).
+  probability ConfidenceLevel?
+  impact      ConfidenceLevel
+  evidence    String?          @db.Text
+  status      RiskStatus       @default(MONITORING)
+  mitigation  String?          @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([investmentCaseId])
+  @@map("investment_case_risks")
+}
+
+model InvestmentCaseCatalyst {
+  id               String         @id @default(cuid())
+  investmentCaseId String
+  investmentCase   InvestmentCase @relation(fields: [investmentCaseId], references: [id], onDelete: Cascade)
+
+  catalyst        String          @db.Text
+  // Free text, e.g. "Q2 2027" — matches the spec's own examples.
+  timeframe       String
+  evidence        String?         @db.Text
+  potentialImpact ConfidenceLevel
+  status          CatalystStatus  @default(UPCOMING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([investmentCaseId])
+  @@map("investment_case_catalysts")
+}
+
+model InvestmentCaseInvalidationCriterion {
+  id               String         @id @default(cuid())
+  investmentCaseId String
+  investmentCase   InvestmentCase @relation(fields: [investmentCaseId], references: [id], onDelete: Cascade)
+
+  // Always required — the human-readable condition, e.g. "Revenue growth
+  // remains below 8% for 3 consecutive quarters."
+  description String @db.Text
+
+  // Machine-checkable fields, all nullable together — when `metric` is
+  // null this criterion is purely qualitative (e.g. "Major product launch
+  // fails") and can only ever be reviewed manually.
+  metric             InvestmentAssumptionMetric?
+  comparator         InvalidationComparator?
+  thresholdValue     Float?
+  thresholdUnit      String?
+  consecutivePeriods Int?
+
+  status InvalidationCriterionStatus @default(ACTIVE)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([investmentCaseId])
+  @@map("investment_case_invalidation_criteria")
+}
+
+model InvestmentCaseReview {
+  id               String         @id @default(cuid())
+  investmentCaseId String
+  investmentCase   InvestmentCase @relation(fields: [investmentCaseId], references: [id], onDelete: Cascade)
+
+  type       ReviewType
+  reviewedAt DateTime   @default(now())
+
+  // Deterministically assembled at review-start time: new research events
+  // (Milestone 11), financial/valuation changes, new risks/catalysts,
+  // assumption changes, historical validation summary (Milestone 12), and
+  // the evidence matrix as it stood at that moment — see
+  // lib/investmentCase/types.ts's ReviewSummary for the exact shape.
+  summary Json
+
+  // Null until the user completes the confirmation step; the review row
+  // itself is created up front so "start a review" is always durable even
+  // if the user never finishes confirming it.
+  outcome ReviewOutcome?
+  notes   String?        @db.Text
+
+  createdAt DateTime @default(now())
+
+  @@index([investmentCaseId, reviewedAt])
+  @@map("investment_case_reviews")
+}
+
+model InvestmentCaseVersion {
+  id               String         @id @default(cuid())
+  investmentCaseId String
+  investmentCase   InvestmentCase @relation(fields: [investmentCaseId], references: [id], onDelete: Cascade)
+
+  // Incrementing per case, starting at 1 — never reused, never overwritten,
+  // matching ResearchReport's own versioning discipline (Milestone 9).
+  version Int
+
+  // The full frozen snapshot a memo or a version-to-version diff needs:
+  // thesis fields, assumptions, evidence, risks, catalysts, invalidation
+  // criteria, and the live valuation read AT THE MOMENT this version was
+  // created — see lib/investmentCase/types.ts's CaseSnapshot for the exact
+  // shape.
+  snapshot Json
+
+  createdAt DateTime @default(now())
+
+  memo InvestmentMemo?
+
+  @@unique([investmentCaseId, version])
+  @@index([investmentCaseId])
+  @@map("investment_case_versions")
+}
+
+model InvestmentMemo {
+  id               String         @id @default(cuid())
+  investmentCaseId String
+  investmentCase   InvestmentCase @relation(fields: [investmentCaseId], references: [id], onDelete: Cascade)
+
+  versionId String                @unique
+  version   InvestmentCaseVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+
+  // Matches ResearchReport's own AI-generation resilience pattern: a FAILED
+  // row is still fully persisted (with the version snapshot it was
+  // attempted against) rather than the generation attempt vanishing.
+  status AnalysisStatus
+  model  String?
+  error  String?
+
+  // The full 16-section structured memo (spec section 21) — see
+  // lib/investmentCase/types.ts's InvestmentMemoContent for the exact
+  // shape. Every figure in it traces back to `version.snapshot`; only a
+  // small, explicitly-bounded set of narrative fields (executive summary,
+  // conclusion) are AI-written, and even those cite only numbers already
+  // present in the snapshot.
+  content Json?
+
+  inputTokens  Int?
+  outputTokens Int?
+
+  createdAt DateTime @default(now())
+
+  @@index([investmentCaseId, createdAt])
+  @@map("investment_memos")
+}
+
+// ---------------------------------------------------------------------------
+// Data Quality, Model Audit & Research Integrity Engine (Milestone 14)
+//
+// A read-mostly audit layer over Milestones 1-13 - explicitly NOT a system
+// that makes Atlas look more confident. Its purpose is to let Atlas say
+// "something is wrong / missing / stale / doesn't reconcile / can't be
+// verified" and to make that claim explainable and auditable. Nothing in
+// this section ever mutates a financial statement, a DCF/comps result, a
+// research report, or an investment case - every model below is either an
+// append-only check/audit/log record or a tracked issue with an explicit,
+// human-driven resolution workflow.
+//
+// Every integrity entity here is GLOBAL and company-scoped (shared research
+// intelligence, exactly like ResearchEvent in Milestone 11) - not
+// per-user - since data quality is a property of Atlas's shared research
+// corpus, not of any one user's private state. Acknowledging/resolving an
+// issue records WHICH user did it (acknowledgedByUserId/resolvedByUserId,
+// a bare id, no FK - these are accountability fields, not ownership) but the
+// issue itself is visible to every authenticated user, matching how a
+// ResearchEvent or a ResearchReport is shared.
+//
+// DataQualityCheck and ModelAudit are deliberately APPEND-ONLY (never
+// updated in place) - matching FinancialDataRefreshLog's own discipline
+// (Milestone 3): the "current" state of a dimension is simply its most
+// recent row, and the full history stays queryable for the audit trail
+// (spec section 23's "what did Atlas know, when did it know it").
+// IntegritySnapshot is the one row that IS upserted per company - a cached,
+// recomputed-on-demand rollup so the dashboard never has to re-run every
+// check on every page load (spec section 29).
+// ---------------------------------------------------------------------------
+
+enum DataQualityDimension {
+  COMPLETENESS
+  ACCURACY
+  FRESHNESS
+  CONSISTENCY
+  SOURCE_QUALITY
+  TRACEABILITY
+  TIMELINESS
+  CALCULATION_INTEGRITY
+}
+
+enum FreshnessStatus {
+  CURRENT
+  AGING
+  STALE
+  UNKNOWN
+}
+
+// Spec section 4 - a configurable source hierarchy. The enum itself is the
+// fixed set of tiers; which concrete source types map to which tier is
+// configuration (lib/integrity/sourceHierarchy.ts), not hardcoded here.
+enum SourceTier {
+  TIER_1
+  TIER_2
+  TIER_3
+  TIER_4
+}
+
+// The datasets/models spec section 19's company integrity panel enumerates
+// by name - used to tag checks, issues, and audits so the dashboard can
+// filter by "DCF issues" vs "Comps issues" vs "SEC issues" etc (spec
+// section 20).
+enum IntegrityDatasetType {
+  MARKET_DATA
+  FINANCIAL_STATEMENTS
+  SEC_FILINGS
+  EARNINGS
+  DCF_MODEL
+  COMPS_MODEL
+  HISTORICAL_VALIDATION
+  RESEARCH_REPORT
+  INVESTMENT_CASE
+}
+
+enum IntegrityIssueCategory {
+  DATA_COMPLETENESS
+  DATA_FRESHNESS
+  DATA_DISCREPANCY
+  FINANCIAL_RECONCILIATION
+  MARKET_DATA_INTEGRITY
+  DCF_MODEL_ERROR
+  DCF_STALE
+  COMPS_MODEL_ERROR
+  RESEARCH_REPORT_MISMATCH
+  AI_CLAIM_REJECTED
+  RESEARCH_CONTRADICTION
+  THESIS_ASSUMPTION_CONFLICT
+  HISTORICAL_VALIDATION_LIMITATION
+  SOURCE_UNVERIFIED
+}
+
+enum IntegrityIssueSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum IntegrityIssueStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+  IGNORED
+}
+
+enum ClaimValidationStatus {
+  VERIFIED
+  UNVERIFIED
+  CONTRADICTED
+  STALE
+  REJECTED
+}
+
+enum ResearchIntegrityStatus {
+  VERIFIED
+  MINOR_ISSUES
+  REVIEW_REQUIRED
+  SIGNIFICANT_ISSUES
+  CRITICAL
+}
+
+enum AuditLogAction {
+  CHECK_RUN
+  ISSUE_CREATED
+  ISSUE_ACKNOWLEDGED
+  ISSUE_RESOLVED
+  ISSUE_IGNORED
+  ISSUE_AUTO_RESOLVED
+  CLAIM_CREATED
+  CLAIM_VALIDATED
+  MODEL_AUDIT_RUN
+  SNAPSHOT_COMPUTED
+
+  // Milestone 15 — Institutional Research Workspace & Collaboration Layer.
+  WORKSPACE_CREATED
+  MEMBER_ADDED
+  MEMBER_REMOVED
+  MEMBER_ROLE_CHANGED
+  PROJECT_CREATED
+  PROJECT_UPDATED
+  COVERAGE_ASSIGNED
+  TASK_CREATED
+  TASK_ASSIGNED
+  TASK_COMPLETED
+  NOTE_CREATED
+  COMMENT_ADDED
+  REPORT_SUBMITTED_FOR_REVIEW
+  REVIEW_COMMENT_ADDED
+  REPORT_APPROVED
+  MEETING_CREATED
+  MEETING_ACTION_ITEM_CREATED
+  CASE_SUBMITTED_TO_COMMITTEE
+  COMMITTEE_REACTION_ADDED
+}
+
+// One row per (company, dataset, dimension) check RUN - append-only, never
+// updated. `passed` + `detail` together answer "why" (spec section 2: "Do
+// NOT collapse everything into one unexplained score"); `metadata` holds
+// the structured supporting numbers (actual vs. expected, tolerance used,
+// etc.) so a UI can render specifics, not just prose.
+model DataQualityCheck {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  datasetType     IntegrityDatasetType
+  dimension       DataQualityDimension
+  passed          Boolean
+  freshnessStatus FreshnessStatus?
+  detail          String               @db.Text
+  metadata        Json?
+
+  checkedAt DateTime @default(now())
+
+  @@index([companyId, datasetType, dimension, checkedAt])
+  @@map("data_quality_checks")
+}
+
+// A tracked, actionable problem. `dedupeKey` mirrors ResearchEvent's own
+// discipline (Milestone 11): re-running checks that still find the same
+// underlying problem never creates a second OPEN issue for it - the
+// existing row's detectedAt/detail simply isn't touched, only genuinely
+// NEW problems create a new row. Resolving a financial discrepancy, a DCF
+// error, a contradiction, or a thesis conflict is always a human action -
+// see lib/services/integrityIssueService.ts for exactly which categories
+// section 22 permits safe automated resolution for.
+model ResearchIntegrityIssue {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  category    IntegrityIssueCategory
+  severity    IntegrityIssueSeverity
+  datasetType IntegrityDatasetType?
+  description String                 @db.Text
+  source      String
+  detail      Json?
+
+  dedupeKey String
+
+  status IntegrityIssueStatus @default(OPEN)
+
+  acknowledgedByUserId String?
+  acknowledgedAt       DateTime?
+  resolution           String?   @db.Text
+  resolvedByUserId     String?
+  resolvedAt           DateTime?
+  // Required whenever status transitions to IGNORED (spec section 21) -
+  // enforced in lib/services/integrityIssueService.ts, not just at the DB
+  // layer, so the 400 error message stays specific.
+  ignoreReason         String?   @db.Text
+
+  detectedAt DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([companyId, dedupeKey])
+  @@index([companyId, status])
+  @@index([severity, status])
+  @@map("research_integrity_issues")
+}
+
+// Spec section 14 - the research claim registry, the foundation for
+// research integrity across Atlas. claimSourceType/claimSourceId are a
+// loose (non-FK) polymorphic pointer back to whatever produced the claim
+// (a ResearchReport, an InvestmentMemo, or a manually-entered claim) - kept
+// loose deliberately so this milestone never needs a schema change to
+// Milestones 9/13's own tables to wire claims up to them.
+model ResearchClaim {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  // Milestone 15 — optional link to the specific report a claim was drawn
+  // from, so citationCoverageService.ts can compute a real per-report
+  // coverage percentage. Nullable because nothing in Atlas yet auto-extracts
+  // claims from a report's own prose (see docs/research-integrity.md's
+  // known limitations) — a report with no linked claims reports coverage as
+  // "Not available," never a manufactured number.
+  researchReportId String?
+  researchReport   ResearchReport? @relation(fields: [researchReportId], references: [id], onDelete: SetNull)
+
+  claim       String  @db.Text
+  metric      String?
+  statedValue Float?
+  sourceValue Float?
+  unit        String?
+
+  claimSourceType String
+  claimSourceId   String?
+
+  dataSnapshotAt DateTime?
+  confidence     ConfidenceLevel?
+
+  validationStatus ClaimValidationStatus @default(UNVERIFIED)
+  validationDetail String?               @db.Text
+
+  sources ClaimSource[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([companyId, validationStatus])
+  @@index([companyId, metric])
+  @@index([researchReportId])
+  @@map("research_claims")
+}
+
+// A claim's own cited source(s) - separate from ClaimValidationStatus,
+// which records whether the claim's NUMBER checks out; this table records
+// WHERE the claim says it came from, tiered per lib/integrity/sourceHierarchy.ts.
+model ClaimSource {
+  id      String        @id @default(cuid())
+  claimId String
+  claim   ResearchClaim @relation(fields: [claimId], references: [id], onDelete: Cascade)
+
+  sourceType  String
+  sourceId    String?
+  sourceLabel String
+  sourceTier  SourceTier
+
+  createdAt DateTime @default(now())
+
+  @@index([claimId])
+  @@map("claim_sources")
+}
+
+// One row per DCF or Comps audit RUN - append-only, the model-versioning
+// record spec section 24 asks for on the audit side (DCF/Comps themselves
+// stay live/unpersisted per Milestones 5-6's own design; what's versioned
+// here is Atlas's own evaluation of a model run over time, not the model
+// output itself - see docs/research-integrity.md for the full reasoning).
+model ModelAudit {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  modelType          IntegrityDatasetType
+  methodologyVersion String               @default("1.0")
+
+  passed   Boolean
+  // Array of {check, passed, severity, message} - see lib/integrity/dcfAudit.ts
+  // / compsAudit.ts for the exact shape each finding takes.
+  findings Json
+
+  // The model inputs/outputs actually audited, frozen at audit time - so a
+  // past audit result stays reproducible even after the live model moves.
+  inputsSnapshot Json
+
+  auditedAt DateTime @default(now())
+
+  @@index([companyId, modelType, auditedAt])
+  @@map("model_audits")
+}
+
+// Append-only audit trail (spec section 23) - "what did Atlas know, when
+// did it know it, and why did it produce this conclusion." Entries are
+// written by the integrity engine's OWN actions (checks run, issues
+// created/resolved, claims created/validated, audits run, snapshots
+// recomputed) - this milestone does not retrofit write-hooks into every
+// Milestone 1-13 mutation path, which would mean rewriting those milestones
+// unnecessarily (explicitly out of scope per spec section 30).
+model AuditLogEntry {
+  id String @id @default(cuid())
+
+  companyId String?
+  company   Company? @relation(fields: [companyId], references: [id], onDelete: SetNull)
+
+  // Milestone 15 — nullable so every Milestone 14 entry (company-scoped,
+  // pre-dates workspaces) stays valid; every NEW Milestone 15 action is
+  // written with this set, so a workspace's own audit trail can be filtered
+  // without scanning every company-scoped entry in Atlas.
+  workspaceId String?
+  workspace   Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+
+  entityType  String
+  entityId    String?
+  action      AuditLogAction
+  actorUserId String?
+  detail      Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId, createdAt])
+  @@index([workspaceId, createdAt])
+  @@index([entityType, entityId])
+  @@map("audit_log_entries")
+}
+
+// The one integrity model that IS upserted (not append-only) - a cached
+// rollup of a company's current overall status, recomputed on demand by
+// lib/services/integritySnapshotService.ts rather than on every dashboard
+// load (spec section 29). dimensions holds the per-dataset breakdown the
+// company integrity panel renders (spec section 19); reasons is always a
+// non-empty, human-readable array whenever status isn't VERIFIED - the
+// same "never a bare label" discipline as Milestone 13's ThesisHealth.
+model IntegritySnapshot {
+  id        String  @id @default(cuid())
+  companyId String  @unique
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  status  ResearchIntegrityStatus
+  reasons Json
+
+  // {marketData, financialStatements, secFilings, earnings, dcf, comps,
+  //  researchReport, investmentCase} -> {status, detail} - see
+  // lib/integrity/integrityStatus.ts for the exact shape.
+  dimensions Json
+
+  openIssueCount     Int @default(0)
+  criticalIssueCount Int @default(0)
+
+  computedAt DateTime @default(now())
+
+  @@map("integrity_snapshots")
+}
+
+// ---------------------------------------------------------------------------
+// Institutional Research Workspace & Collaboration Layer (Milestone 15)
+//
+// This milestone is an ORGANIZATIONAL AND COLLABORATION layer on top of
+// Milestones 1-14 — it does not duplicate financial data, research-event
+// processing, or integrity checks, and it deliberately does not become a
+// social network, a general-purpose project-management tool, or a chat app.
+//
+// Two genuinely difficult architectural tensions, resolved explicitly:
+//
+// 1. Company/financial data (Milestones 1-8) stays exactly as global and
+//    shared as it always was. A workspace never owns or forks a Company row
+//    — CompanyCoverage, ResearchProjectCompany, and MeetingCompany are all
+//    thin join tables pointing AT the existing global Company, the same
+//    "point at global data, never duplicate it" discipline every prior
+//    milestone (Watchlist, Portfolio, Milestone 14's own AuditLogEntry) uses.
+//
+// 2. ResearchReport (Milestone 9) stays globally readable exactly as it
+//    always was — this milestone adds an optional `projectId` link and a
+//    `reviewStatus` workflow field, but never restricts who can READ a
+//    report. InvestmentCase (Milestone 13) stays PRIVATE, per-user data
+//    exactly as it always was — an optional `projectId` link is purely
+//    organizational, and the one genuine visibility change is Investment
+//    Committee Review (spec section 20): the case OWNER explicitly submits
+//    one case at a time to make it visible (read-only, plus reactions) to
+//    workspace peers. This is a narrow, explicit, owner-initiated exception,
+//    never a wholesale change to InvestmentCase's default privacy.
+//
+// The genuinely NEW workspace-private data — ResearchProject, ResearchTask,
+// ResearchNote, ResearchComment, ResearchReview (+ checklist + section
+// comments), ResearchMeeting (+ participants + action items), and
+// CompanyCoverage assignments — is where workspace-membership authorization
+// is actually enforced and tested (see app/api/crossUserAccess.test.ts's
+// "workspace" describe block).
+//
+// Every FK to User below that is the SECOND-OR-LATER relation between its
+// model and User carries an explicit @relation name (e.g. ResearchTask's
+// assignedUserId/createdByUserId) — Prisma requires this whenever a model
+// pair has more than one connection; every single-connection FK stays
+// unnamed, matching this schema's existing convention throughout.
+// ---------------------------------------------------------------------------
+
+enum WorkspaceRole {
+  OWNER
+  ADMIN
+  ANALYST
+  VIEWER
+}
+
+enum ResearchProjectStatus {
+  PLANNED
+  ACTIVE
+  UNDER_REVIEW
+  COMPLETED
+  ARCHIVED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  BLOCKED
+  COMPLETED
+}
+
+enum CommentParentType {
+  RESEARCH_REPORT
+  INVESTMENT_CASE
+  RESEARCH_NOTE
+  RESEARCH_TASK
+}
+
+// The report's own workflow stage (spec section 9) — distinct from
+// ResearchReport.status (AnalysisStatus: did generation succeed), which
+// this field never touches or replaces.
+enum ReportReviewStatus {
+  DRAFT
+  IN_REVIEW
+  APPROVED
+  ARCHIVED
+}
+
+enum ReviewSectionCommentStatus {
+  OPEN
+  RESOLVED
+}
+
+enum CommitteeReviewStatus {
+  NOT_SUBMITTED
+  SUBMITTED
+}
+
+enum CommitteeReactionType {
+  SUPPORT
+  CONCERN
+  QUESTION
+}
+
+model Workspace {
+  id   String @id @default(cuid())
+  name String
+  slug String @unique
+
+  createdByUserId String
+  createdBy       User   @relation(fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  members         WorkspaceMember[]
+  coverage        CompanyCoverage[]
+  projects        ResearchProject[]
+  tasks           ResearchTask[]
+  notes           ResearchNote[]
+  comments        ResearchComment[]
+  reviews         ResearchReview[]
+  meetings        ResearchMeeting[]
+  auditLogEntries AuditLogEntry[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("workspaces")
+}
+
+// The one row every M15 authorization check resolves first (spec section
+// 26: User -> Workspace Membership -> Role -> Resource Permission) — see
+// lib/services/workspaceService.ts's requireWorkspaceRole(), the shared
+// choke point every other M15 service calls rather than re-checking
+// membership independently.
+model WorkspaceMember {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  role WorkspaceRole @default(ANALYST)
+
+  joinedAt DateTime @default(now())
+
+  @@unique([workspaceId, userId])
+  @@index([userId])
+  @@map("workspace_members")
+}
+
+// Spec section 4 — "NVDA -> Nehemiah." One current owner per (workspace,
+// company); reassignment updates this row rather than appending a history
+// row (the ACTION of assigning/reassigning is still auditable via
+// AuditLogEntry). analystUserId must be a member of `workspace` — enforced
+// in companyCoverageService.ts, not a DB constraint Prisma can express.
+model CompanyCoverage {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  companyId   String
+  company     Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  analystUserId String
+  analyst       User   @relation(fields: [analystUserId], references: [id], onDelete: Restrict)
+
+  assignedAt DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([workspaceId, companyId])
+  @@index([workspaceId, analystUserId])
+  @@map("company_coverage")
+}
+
+model ResearchProject {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  name        String
+  description String?               @db.Text
+  status      ResearchProjectStatus @default(PLANNED)
+
+  ownerUserId String
+  owner       User   @relation(fields: [ownerUserId], references: [id], onDelete: Restrict)
+
+  members         ResearchProjectMember[]
+  companies       ResearchProjectCompany[]
+  reports         ResearchReport[]
+  investmentCases InvestmentCase[]
+  tasks           ResearchTask[]
+  notes           ResearchNote[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([workspaceId, status])
+  @@map("research_projects")
+}
+
+model ResearchProjectMember {
+  id        String          @id @default(cuid())
+  projectId String
+  project   ResearchProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  addedAt DateTime @default(now())
+
+  @@unique([projectId, userId])
+  @@map("research_project_members")
+}
+
+model ResearchProjectCompany {
+  id        String          @id @default(cuid())
+  projectId String
+  project   ResearchProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  companyId String
+  company   Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  addedAt DateTime @default(now())
+
+  @@unique([projectId, companyId])
+  @@map("research_project_companies")
+}
+
+// Spec section 5 — deliberately narrow: a research task, not a
+// general-purpose to-do item. companyId/projectId are both optional (a task
+// can be company-specific, project-specific, both, or neither — e.g. a
+// pure workspace-administration task).
+model ResearchTask {
+  id          String           @id @default(cuid())
+  workspaceId String
+  workspace   Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  projectId   String?
+  project     ResearchProject? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  companyId   String?
+  company     Company?         @relation(fields: [companyId], references: [id], onDelete: SetNull)
+
+  title       String
+  description String? @db.Text
+
+  assignedUserId  String?
+  assignedUser    User?   @relation("TaskAssignee", fields: [assignedUserId], references: [id], onDelete: SetNull)
+  createdByUserId String
+  createdBy       User    @relation("TaskCreator", fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  priority TaskPriority @default(MEDIUM)
+  status   TaskStatus   @default(TODO)
+
+  dueDate     DateTime?
+  completedAt DateTime?
+
+  // Set when this task was auto-created from a research meeting's action
+  // item (spec section 21) — nullable, since most tasks are created
+  // directly, not via a meeting.
+  meetingActionItem MeetingActionItem?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([workspaceId, status])
+  @@index([assignedUserId, status])
+  @@index([companyId])
+  @@index([projectId])
+  @@map("research_tasks")
+}
+
+// Spec section 6-7 — a structured analyst note, optionally company- and/or
+// project-scoped, with optional source references (NoteSource below) that
+// must point at a REAL Atlas source — no fake source IDs, validated the
+// same way Milestone 14's claim citations are (lib/workspace/
+// noteSourceValidation.ts).
+model ResearchNote {
+  id          String           @id @default(cuid())
+  workspaceId String
+  workspace   Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  companyId   String?
+  company     Company?         @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  projectId   String?
+  project     ResearchProject? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  authorId String
+  author   User   @relation(fields: [authorId], references: [id], onDelete: Restrict)
+
+  title   String
+  content String   @db.Text
+  tags    String[]
+
+  sources NoteSource[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([workspaceId, companyId])
+  @@index([workspaceId, createdAt])
+  @@map("research_notes")
+}
+
+// Mirrors Milestone 14's ClaimSource pattern exactly: sourceType/sourceId
+// are a loose, service-layer-validated pointer at a real SecFiling,
+// EarningsCall, ResearchEvent, or other existing Atlas source — never a DB
+// FK (the target model varies by sourceType), never accepted unvalidated.
+model NoteSource {
+  id     String       @id @default(cuid())
+  noteId String
+  note   ResearchNote @relation(fields: [noteId], references: [id], onDelete: Cascade)
+
+  sourceType  String
+  sourceId    String?
+  sourceLabel String
+
+  createdAt DateTime @default(now())
+
+  @@index([noteId])
+  @@map("note_sources")
+}
+
+// Spec section 8 — deliberately simple: no threads, no reactions, no
+// read-receipts. parentType/parentId are a loose polymorphic pointer
+// (report/case/note/task), existence + workspace-scoping validated in
+// researchCommentService.ts, matching NoteSource's own polymorphic pattern
+// above and ResearchClaim's claimSourceType/claimSourceId (Milestone 14).
+model ResearchComment {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  authorId String
+  author   User   @relation(fields: [authorId], references: [id], onDelete: Restrict)
+
+  content    String            @db.Text
+  parentType CommentParentType
+  parentId   String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([workspaceId, parentType, parentId])
+  @@map("research_comments")
+}
+
+// One row per review CYCLE (spec section 9) — a report can accumulate
+// several over its lifetime (submit, revise, resubmit); each stays exactly
+// as it was, never overwritten. The report's OWN current stage lives on
+// ResearchReport.reviewStatus; this row is the audit trail of one cycle.
+// approvedAt/approvedByUserId null = still pending, mirroring
+// InvestmentCaseReview's own "outcome: null until decided" convention.
+model ResearchReview {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  researchReportId String
+  researchReport   ResearchReport @relation(fields: [researchReportId], references: [id], onDelete: Cascade)
+
+  requestedByUserId String
+  requestedBy       User    @relation("ReviewRequester", fields: [requestedByUserId], references: [id], onDelete: Restrict)
+  reviewerUserId    String?
+  reviewer          User?   @relation("ReviewReviewer", fields: [reviewerUserId], references: [id], onDelete: SetNull)
+
+  approvedByUserId String?
+  approvedBy       User?     @relation("ReviewApprover", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+  approvedAt       DateTime?
+
+  checklistItems  ReviewChecklistItem[]
+  sectionComments ReviewSectionComment[]
+
+  submittedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([workspaceId, researchReportId])
+  @@index([reviewerUserId])
+  @@map("research_reviews")
+}
+
+// Spec section 10's ten-item checklist, seeded verbatim when a review is
+// created (see lib/workspace/reviewChecklist.ts) — connects directly to
+// Milestone 14 (e.g. "Research integrity status reviewed").
+model ReviewChecklistItem {
+  id       String         @id @default(cuid())
+  reviewId String
+  review   ResearchReview @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+
+  label   String
+  checked Boolean @default(false)
+
+  checkedByUserId String?
+  checkedBy       User?     @relation(fields: [checkedByUserId], references: [id], onDelete: SetNull)
+  checkedAt       DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([reviewId])
+  @@map("review_checklist_items")
+}
+
+// Spec section 11 — section-flagged reviewer comments. Never deleted
+// (status flips OPEN -> RESOLVED instead) so the review's audit trail stays
+// complete even after every comment is addressed.
+model ReviewSectionComment {
+  id       String         @id @default(cuid())
+  reviewId String
+  review   ResearchReview @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+
+  // Free text naming the flagged section (e.g. "DCF", "Comps", "Risks") —
+  // not a fixed enum, since report sections vary (see lib/research/types.ts).
+  section String
+
+  authorId String
+  author   User   @relation("SectionCommentAuthor", fields: [authorId], references: [id], onDelete: Restrict)
+  content  String @db.Text
+
+  status ReviewSectionCommentStatus @default(OPEN)
+
+  resolvedByUserId String?
+  resolvedBy       User?     @relation("SectionCommentResolver", fields: [resolvedByUserId], references: [id], onDelete: SetNull)
+  resolvedAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([reviewId, status])
+  @@map("review_section_comments")
+}
+
+// Spec section 21 — a research meeting. Decisions are kept as plain text
+// bullets (String[]) rather than a separate model since they're read-only
+// once recorded; action items get their own model below because they can
+// spawn a real ResearchTask.
+model ResearchMeeting {
+  id          String    @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  title     String
+  date      DateTime
+  notes     String?  @db.Text
+  decisions String[]
+
+  createdByUserId String
+  createdBy       User   @relation(fields: [createdByUserId], references: [id], onDelete: Restrict)
+
+  participants MeetingParticipant[]
+  companies    MeetingCompany[]
+  actionItems  MeetingActionItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([workspaceId, date])
+  @@map("research_meetings")
+}
+
+model MeetingParticipant {
+  id        String          @id @default(cuid())
+  meetingId String
+  meeting   ResearchMeeting @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  addedAt DateTime @default(now())
+
+  @@unique([meetingId, userId])
+  @@map("meeting_participants")
+}
+
+model MeetingCompany {
+  id        String          @id @default(cuid())
+  meetingId String
+  meeting   ResearchMeeting @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  companyId String
+  company   Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  addedAt DateTime @default(now())
+
+  @@unique([meetingId, companyId])
+  @@map("meeting_companies")
+}
+
+// Spec section 21's "action items should automatically create research
+// tasks where appropriate" — taskId is nullable + unique (an action item
+// creates AT MOST one linked task, set at creation time when the caller
+// opts in; a purely informational action item stays task-less).
+model MeetingActionItem {
+  id        String          @id @default(cuid())
+  meetingId String
+  meeting   ResearchMeeting @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+
+  description String @db.Text
+
+  assignedUserId String?
+  assignedUser   User?   @relation(fields: [assignedUserId], references: [id], onDelete: SetNull)
+
+  taskId String?       @unique
+  task   ResearchTask? @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([meetingId])
+  @@map("meeting_action_items")
+}
+
+// Spec section 20 — internal review reactions on an InvestmentCase
+// submitted to committee review. Explicitly never aggregated into an
+// automatic recommendation (enforced by never having a "decision" field
+// anywhere on this model or InvestmentCase) — a reaction is a reaction,
+// nothing more.
+model CommitteeReviewReaction {
+  id               String         @id @default(cuid())
+  investmentCaseId String
+  investmentCase   InvestmentCase @relation(fields: [investmentCaseId], references: [id], onDelete: Cascade)
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  reactionType CommitteeReactionType
+  content      String?               @db.Text
+
+  createdAt DateTime @default(now())
+
+  @@index([investmentCaseId, reactionType])
+  @@map("committee_review_reactions")
+}

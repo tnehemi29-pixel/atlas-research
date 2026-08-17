@@ -1,0 +1,137 @@
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { db } from '@/lib/db';
+import { getLatestDataQualityChecks, runDataQualityChecks } from './dataQualityService';
+
+const TICKER = 'ZZDQS1';
+
+async function cleanup() {
+  const company = await db.company.findUnique({ where: { ticker: TICKER } });
+  if (company) await db.dataQualityCheck.deleteMany({ where: { companyId: company.id } });
+  await db.company.deleteMany({ where: { ticker: TICKER } });
+}
+
+async function makeCompany(overrides: { price?: number | null; marketCap?: number | null; quoteUpdatedAt?: Date | null } = {}) {
+  return db.company.create({
+    data: {
+      ticker: TICKER,
+      name: 'Data Quality Test Co.',
+      price: overrides.price ?? 100,
+      marketCap: overrides.marketCap ?? 1_000_000_000,
+      quoteUpdatedAt: overrides.quoteUpdatedAt === undefined ? new Date() : overrides.quoteUpdatedAt,
+    },
+  });
+}
+
+async function makePeriod(companyId: string, fiscalYear: number, overrides: { revenue?: number | null; totalAssets?: number | null; cashAndEquivalents?: number | null } = {}) {
+  const revenue = overrides.revenue ?? 500_000_000;
+  return db.financialPeriod.create({
+    data: {
+      companyId,
+      fiscalYear,
+      fiscalPeriod: 'FY',
+      periodType: 'ANNUAL',
+      periodEnd: new Date(`${fiscalYear}-12-31`),
+      filingDate: new Date(`${fiscalYear + 1}-02-01`),
+      incomeStatement: {
+        create: {
+          revenue,
+          costOfRevenue: revenue * 0.4,
+          grossProfit: revenue * 0.6,
+          operatingExpenses: revenue * 0.2,
+          operatingIncome: revenue * 0.4,
+          dilutedSharesOutstanding: 10_000_000,
+        },
+      },
+      balanceSheet: {
+        create: {
+          totalAssets: overrides.totalAssets ?? 800_000_000,
+          totalLiabilities: 300_000_000,
+          stockholdersEquity: 500_000_000,
+          shortTermDebt: 20_000_000,
+          longTermDebt: 80_000_000,
+          cashAndEquivalents: overrides.cashAndEquivalents ?? 150_000_000,
+        },
+      },
+      cashFlowStatement: {
+        create: {
+          operatingCashFlow: 200_000_000,
+          capex: 50_000_000,
+          investingCashFlow: -50_000_000,
+          financingCashFlow: -30_000_000,
+          freeCashFlow: 150_000_000,
+        },
+      },
+    },
+  });
+}
+
+describe('dataQualityService', () => {
+  beforeAll(cleanup);
+  afterAll(cleanup);
+  afterEach(cleanup);
+
+  it('runs freshness, completeness, and reconciliation checks and persists them', async () => {
+    const company = await makeCompany();
+    await makePeriod(company.id, 2025);
+
+    const outcomes = await runDataQualityChecks(company.id);
+    expect(outcomes.length).toBeGreaterThan(0);
+
+    // SEC filing / earnings freshness are legitimately UNKNOWN (never
+    // "passed") since this fixture has no SecFiling/EarningsCall rows —
+    // everything else (market data freshness, financial-statement
+    // freshness/completeness/reconciliation, market cap reconciliation)
+    // should pass for well-formed, internally-consistent fixture data.
+    const checkable = outcomes.filter((o) => !(o.dimension === 'FRESHNESS' && o.freshnessStatus === 'UNKNOWN'));
+    expect(checkable.length).toBeGreaterThan(0);
+    expect(checkable.every((o) => o.passed)).toBe(true);
+
+    const persisted = await db.dataQualityCheck.findMany({ where: { companyId: company.id } });
+    expect(persisted.length).toBe(outcomes.length);
+  });
+
+  it('flags a balance-sheet reconciliation failure when assets do not equal liabilities + equity', async () => {
+    const company = await makeCompany();
+    await makePeriod(company.id, 2025, { totalAssets: 999_000_000 }); // should be 300M + 500M = 800M
+
+    const outcomes = await runDataQualityChecks(company.id);
+    const balanceSheetCheck = outcomes.find((o) => o.detail.includes('Balance sheet'));
+    expect(balanceSheetCheck?.passed).toBe(false);
+  });
+
+  it('flags market cap reconciliation failure when marketCap does not equal price x shares', async () => {
+    const company = await makeCompany({ price: 100, marketCap: 5_000_000_000 }); // should be ~1B
+    await makePeriod(company.id, 2025);
+
+    const outcomes = await runDataQualityChecks(company.id);
+    const marketCapCheck = outcomes.find((o) => o.detail.includes('Market cap'));
+    expect(marketCapCheck?.passed).toBe(false);
+  });
+
+  it('reports data unavailable for completeness when no financial period exists', async () => {
+    const company = await makeCompany();
+    const outcomes = await runDataQualityChecks(company.id);
+    const completenessCheck = outcomes.find((o) => o.dimension === 'COMPLETENESS');
+    expect(completenessCheck?.passed).toBe(false);
+    expect(completenessCheck?.detail).toMatch(/Data unavailable/);
+  });
+
+  it('classifies market data freshness as UNKNOWN when there is no quote timestamp', async () => {
+    const company = await makeCompany({ quoteUpdatedAt: null });
+    await makePeriod(company.id, 2025);
+    const outcomes = await runDataQualityChecks(company.id);
+    const marketFreshness = outcomes.find((o) => o.datasetType === 'MARKET_DATA' && o.dimension === 'FRESHNESS');
+    expect(marketFreshness?.freshnessStatus).toBe('UNKNOWN');
+  });
+
+  it('getLatestDataQualityChecks returns only the most recent result per distinct check', async () => {
+    const company = await makeCompany();
+    await makePeriod(company.id, 2025);
+    await runDataQualityChecks(company.id);
+    await runDataQualityChecks(company.id); // run twice — should not double the "latest" set
+
+    const latest = await getLatestDataQualityChecks(company.id);
+    const allRows = await db.dataQualityCheck.findMany({ where: { companyId: company.id } });
+    expect(allRows.length).toBe(latest.length * 2);
+  });
+});

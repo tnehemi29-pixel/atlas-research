@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Research-report print/export formatting (Milestone 9): every collapsed
+   <details> section forces open so nothing is missing from a printed/PDF
+   copy, and screen-only chrome (nav, buttons, citation chips) disappears. */
+@media print {
+  details:not([open]) > *:not(summary) {
+    display: block !important;
+  }
+}
