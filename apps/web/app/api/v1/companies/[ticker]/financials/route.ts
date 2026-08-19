@@ -31,6 +31,11 @@ export async function GET(request: NextRequest, { params }: { params: { ticker: 
     if (error instanceof SecRequestError) {
       return NextResponse.json({ error: 'SEC EDGAR is unavailable right now.' }, { status: 502 });
     }
+    console.error('[financials] Unexpected error', {
+      ticker: params.ticker,
+      periodType,
+      error,
+    });
     return NextResponse.json(
       { error: 'Unexpected error while loading financial data.' },
       { status: 500 },
