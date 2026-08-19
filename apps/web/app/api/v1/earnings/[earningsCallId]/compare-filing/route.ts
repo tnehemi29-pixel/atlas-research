@@ -6,8 +6,12 @@ import {
   getOrCreateEarningsFilingComparison,
 } from '@/lib/services/earningsCallService';
 import { FilingNotFoundError } from '@/lib/services/secFilingService';
+import { AI_RATE_LIMIT, checkRateLimit, getClientIp, rateLimitResponse } from '@/lib/security/rateLimit';
 
 export const dynamic = 'force-dynamic';
+
+/** A single AI comparison call across an earnings call and a SEC filing. */
+export const maxDuration = 30;
 
 async function resolveSecFilingId(earningsCallId: string, explicitFilingId: string | null): Promise<string | null> {
   if (explicitFilingId) return explicitFilingId;
@@ -40,8 +44,12 @@ export async function GET(request: NextRequest, { params }: { params: { earnings
 /** POST /api/v1/earnings/[earningsCallId]/compare-filing?filingId=[secFilingId]&regenerate=true
  * Generates (or regenerates) the cross-source comparison. Reuses Milestone
  * 7's filing processing pipeline (getFilingWithSections) to make sure the
- * filing has sections before comparing. */
+ * filing has sections before comparing.
+ * Rate-limited by IP — this route is intentionally public. */
 export async function POST(request: NextRequest, { params }: { params: { earningsCallId: string } }) {
+  const { allowed, retryAfterSeconds } = checkRateLimit('ai', getClientIp(request), AI_RATE_LIMIT);
+  if (!allowed) return rateLimitResponse(retryAfterSeconds, 'Too many comparison requests from this client. Please try again shortly.');
+
   const regenerate = request.nextUrl.searchParams.get('regenerate') === 'true';
   const secFilingId = await resolveSecFilingId(params.earningsCallId, request.nextUrl.searchParams.get('filingId'));
   if (!secFilingId) {

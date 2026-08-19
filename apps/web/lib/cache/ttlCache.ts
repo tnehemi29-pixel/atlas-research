@@ -4,6 +4,18 @@
  * stand-in for the Redis cache the architecture calls for — same get/set/ttl
  * shape, so swapping in `@upstash/redis` later is an implementation change
  * inside this file, not a change to any caller.
+ *
+ * SERVERLESS LIMITATION (documented, not fixed here): on a host like Vercel,
+ * each cold-started function instance gets its own empty `store` — a cache
+ * hit here only ever happens within one warm instance's own lifetime, never
+ * shared across concurrent invocations. This is NOT a correctness issue
+ * (every caller already re-fetches from the real provider on a miss), only
+ * a lost efficiency opportunity: expect a lower effective hit rate, and
+ * correspondingly more upstream FMP/SEC requests, on serverless than on a
+ * traditional long-lived server process. Left as-is deliberately — swapping
+ * in a real shared cache is a decision to make once the actual hosting
+ * pattern (and its cost/latency tradeoffs) is settled, not a default to
+ * reach for pre-emptively.
  */
 
 interface CacheEntry<T> {

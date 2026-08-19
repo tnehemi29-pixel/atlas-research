@@ -2,8 +2,12 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { FilingNotFoundError, findPreviousFiling, getOrCreateFilingComparison } from '@/lib/services/secFilingService';
 import { SecRateLimitError, SecRequestError } from '@/lib/providers/secEdgar';
+import { AI_RATE_LIMIT, checkRateLimit, getClientIp, rateLimitResponse } from '@/lib/security/rateLimit';
 
 export const dynamic = 'force-dynamic';
+
+/** A single AI comparison call over two filings' sections. */
+export const maxDuration = 30;
 
 async function resolvePreviousFilingId(filingId: string, explicitPreviousId: string | null): Promise<string | null> {
   if (explicitPreviousId) return explicitPreviousId;
@@ -37,8 +41,12 @@ export async function GET(request: NextRequest, { params }: { params: { filingId
  * Generates (or regenerates) the comparison. Like the analysis route,
  * always 200s with the stored row — a failed AI comparison is still a
  * successfully recorded outcome; the deterministic financial-changes block
- * is present either way. */
+ * is present either way.
+ * Rate-limited by IP — this route is intentionally public. */
 export async function POST(request: NextRequest, { params }: { params: { filingId: string } }) {
+  const { allowed, retryAfterSeconds } = checkRateLimit('ai', getClientIp(request), AI_RATE_LIMIT);
+  if (!allowed) return rateLimitResponse(retryAfterSeconds, 'Too many comparison requests from this client. Please try again shortly.');
+
   const regenerate = request.nextUrl.searchParams.get('regenerate') === 'true';
   const previousFilingId = await resolvePreviousFilingId(params.filingId, request.nextUrl.searchParams.get('with'));
   if (!previousFilingId) {

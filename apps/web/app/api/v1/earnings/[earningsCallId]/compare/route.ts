@@ -5,8 +5,12 @@ import {
   findPreviousEarningsCall,
   getOrCreateEarningsComparison,
 } from '@/lib/services/earningsCallService';
+import { AI_RATE_LIMIT, checkRateLimit, getClientIp, rateLimitResponse } from '@/lib/security/rateLimit';
 
 export const dynamic = 'force-dynamic';
+
+/** A single AI comparison call over two earnings calls' transcripts. */
+export const maxDuration = 30;
 
 async function resolvePreviousCallId(earningsCallId: string, explicitPreviousId: string | null): Promise<string | null> {
   if (explicitPreviousId) return explicitPreviousId;
@@ -39,8 +43,12 @@ export async function GET(request: NextRequest, { params }: { params: { earnings
  * Generates (or regenerates) the comparison. Always 200s with the stored
  * row — a failed AI comparison is still a successfully recorded outcome;
  * the deterministic financial-changes and guidance-summary blocks are
- * present either way. */
+ * present either way.
+ * Rate-limited by IP — this route is intentionally public. */
 export async function POST(request: NextRequest, { params }: { params: { earningsCallId: string } }) {
+  const { allowed, retryAfterSeconds } = checkRateLimit('ai', getClientIp(request), AI_RATE_LIMIT);
+  if (!allowed) return rateLimitResponse(retryAfterSeconds, 'Too many comparison requests from this client. Please try again shortly.');
+
   const regenerate = request.nextUrl.searchParams.get('regenerate') === 'true';
   const previousEarningsCallId = await resolvePreviousCallId(params.earningsCallId, request.nextUrl.searchParams.get('with'));
   if (!previousEarningsCallId) {

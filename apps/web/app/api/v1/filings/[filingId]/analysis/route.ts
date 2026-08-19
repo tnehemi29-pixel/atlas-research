@@ -2,8 +2,13 @@ import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { FilingNotFoundError, getOrCreateFilingAnalysis } from '@/lib/services/secFilingService';
 import { SecRateLimitError, SecRequestError } from '@/lib/providers/secEdgar';
+import { AI_RATE_LIMIT, checkRateLimit, getClientIp, rateLimitResponse } from '@/lib/security/rateLimit';
 
 export const dynamic = 'force-dynamic';
+
+/** A single AI analysis call over one filing's sections — real, but lighter
+ * than full report generation. */
+export const maxDuration = 30;
 
 /** GET /api/v1/filings/[filingId]/analysis
  * Returns the filing's stored analysis only — 404 if none has ever been
@@ -26,8 +31,12 @@ export async function GET(_request: Request, { params }: { params: { filingId: s
  * an HTTP failure; the client checks `status` to render accordingly, and
  * the original filing/sections remain fully accessible either way. Only a
  * genuinely exceptional condition (bad filingId, SEC itself unreachable
- * while re-processing an unprocessed filing) is a non-200 response. */
+ * while re-processing an unprocessed filing) is a non-200 response.
+ * Rate-limited by IP — this route is intentionally public. */
 export async function POST(request: NextRequest, { params }: { params: { filingId: string } }) {
+  const { allowed, retryAfterSeconds } = checkRateLimit('ai', getClientIp(request), AI_RATE_LIMIT);
+  if (!allowed) return rateLimitResponse(retryAfterSeconds, 'Too many analysis requests from this client. Please try again shortly.');
+
   const regenerate = request.nextUrl.searchParams.get('regenerate') === 'true';
 
   try {

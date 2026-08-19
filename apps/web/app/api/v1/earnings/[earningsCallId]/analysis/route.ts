@@ -1,8 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { EarningsCallNotFoundError, getOrCreateEarningsAnalysis } from '@/lib/services/earningsCallService';
+import { AI_RATE_LIMIT, checkRateLimit, getClientIp, rateLimitResponse } from '@/lib/security/rateLimit';
 
 export const dynamic = 'force-dynamic';
+
+/** A single AI analysis call over one earnings call's transcript. */
+export const maxDuration = 30;
 
 /** GET /api/v1/earnings/[earningsCallId]/analysis
  * Returns the call's stored analysis only — 404 if none has ever been
@@ -21,8 +25,12 @@ export async function GET(_request: Request, { params }: { params: { earningsCal
  * analysis. Always returns 200 with the stored analysis row — a failed
  * generation is itself a successfully *recorded* outcome (status: 'FAILED',
  * with `error` explaining why), not an HTTP failure; the original transcript
- * remains fully accessible either way. */
+ * remains fully accessible either way.
+ * Rate-limited by IP — this route is intentionally public. */
 export async function POST(request: NextRequest, { params }: { params: { earningsCallId: string } }) {
+  const { allowed, retryAfterSeconds } = checkRateLimit('ai', getClientIp(request), AI_RATE_LIMIT);
+  if (!allowed) return rateLimitResponse(retryAfterSeconds, 'Too many analysis requests from this client. Please try again shortly.');
+
   const regenerate = request.nextUrl.searchParams.get('regenerate') === 'true';
 
   try {

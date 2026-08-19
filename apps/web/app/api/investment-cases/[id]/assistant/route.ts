@@ -4,8 +4,12 @@ import { askInvestmentThesisAssistant } from '@/lib/ai/investmentThesisAssistant
 import { buildInvestmentCaseContext, collectValidCitationIds } from '@/lib/investmentCase/context';
 import { InvestmentCaseNotFoundError } from '@/lib/services/investmentCaseService';
 import { AiNotConfiguredError, AiRequestError } from '@/lib/ai/anthropicClient';
+import { AI_RATE_LIMIT, checkRateLimit, rateLimitResponse } from '@/lib/security/rateLimit';
 
 export const dynamic = 'force-dynamic';
+
+/** Conversational, but still a real Anthropic call per question. */
+export const maxDuration = 30;
 
 /** POST /api/investment-cases/[id]/assistant — { question }. The assistant
  * only synthesizes/compares/explains/identifies-conflicts/surfaces-questions
@@ -13,7 +17,8 @@ export const dynamic = 'force-dynamic';
  * system prompt) — it never predicts, guarantees, invents, decides, alters
  * a model, or gives personalized advice. Every citation it returns is
  * re-verified against the case's real evidence/research-event ids before
- * being sent back. */
+ * being sent back.
+ * Rate-limited by user id — this route requires auth. */
 export async function POST(request: Request, { params }: { params: { id: string } }) {
   let user;
   try {
@@ -22,6 +27,9 @@ export async function POST(request: Request, { params }: { params: { id: string 
     if (error instanceof UnauthorizedError) return unauthorizedResponse();
     throw error;
   }
+
+  const { allowed, retryAfterSeconds } = checkRateLimit('ai', user.id, AI_RATE_LIMIT);
+  if (!allowed) return rateLimitResponse(retryAfterSeconds, 'Too many assistant questions. Please try again shortly.');
 
   const body = await request.json().catch(() => null);
   const question = typeof body?.question === 'string' ? body.question.trim() : '';
