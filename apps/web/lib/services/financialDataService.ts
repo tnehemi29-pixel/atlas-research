@@ -66,96 +66,118 @@ function findPreviousSameType(
 }
 
 async function persistPeriods(companyId: string, periods: NormalizedPeriod[]): Promise<void> {
+  // Raw facts are collected here (built inside the transaction loop, since
+  // they need each period's freshly-upserted id) but only ever WRITTEN after
+  // the transaction below has committed — see the P2028 note further down.
+  const allRawRows: Prisma.RawFinancialFactCreateManyInput[] = [];
+
   // Runs over the direct (non-pooled) connection — this is a genuinely
-  // multi-statement interactive transaction (a deleteMany, then several
-  // upserts per period), which needs one connection held open throughout;
-  // the pooled `db` client's PgBouncer transaction-mode endpoint doesn't
-  // support that. See lib/db.ts's dbDirect for the full explanation.
-  await dbDirect.$transaction(async (tx) => {
-    // Raw facts are fully regenerated every refresh rather than upserted —
-    // simpler and correct since they're a derived provenance trail, not
-    // user-owned data. See prisma/schema.prisma's RawFinancialFact comment.
-    await tx.rawFinancialFact.deleteMany({ where: { companyId } });
+  // multi-statement interactive transaction (several upserts per period),
+  // which needs one connection held open throughout; the pooled `db`
+  // client's PgBouncer transaction-mode endpoint doesn't support that. See
+  // lib/db.ts's dbDirect for the full explanation.
+  //
+  // Explicit timeout/maxWait: a filer with a deep SEC filing history (e.g.
+  // AAPL, 40-60+ periods) previously exceeded Prisma's default 5s
+  // interactive-transaction timeout purely from the number of sequential
+  // round trips, throwing P2028 ("Transaction already closed"). Only
+  // FinancialPeriod + its statement children are inside this transaction now
+  // (see below) — this timeout is a safety margin on top of that reduction,
+  // not a substitute for it.
+  await dbDirect.$transaction(
+    async (tx) => {
+      for (const period of periods) {
+        const fiscalPeriod = period.fiscalPeriod as PrismaFiscalPeriod;
 
-    for (const period of periods) {
-      const fiscalPeriod = period.fiscalPeriod as PrismaFiscalPeriod;
-
-      const periodRow = await tx.financialPeriod.upsert({
-        where: {
-          companyId_fiscalYear_fiscalPeriod: {
+        const periodRow = await tx.financialPeriod.upsert({
+          where: {
+            companyId_fiscalYear_fiscalPeriod: {
+              companyId,
+              fiscalYear: period.fiscalYear,
+              fiscalPeriod,
+            },
+          },
+          create: {
             companyId,
             fiscalYear: period.fiscalYear,
             fiscalPeriod,
+            periodType: toPrismaPeriodType(period.periodType),
+            periodStart: period.periodStart,
+            periodEnd: period.periodEnd,
+            filingType: period.filingType,
+            filingDate: period.filingDate ? new Date(period.filingDate) : null,
+            accessionNumber: period.accessionNumber,
           },
-        },
-        create: {
-          companyId,
-          fiscalYear: period.fiscalYear,
-          fiscalPeriod,
-          periodType: toPrismaPeriodType(period.periodType),
-          periodStart: period.periodStart,
-          periodEnd: period.periodEnd,
-          filingType: period.filingType,
-          filingDate: period.filingDate ? new Date(period.filingDate) : null,
-          accessionNumber: period.accessionNumber,
-        },
-        update: {
-          periodType: toPrismaPeriodType(period.periodType),
-          periodStart: period.periodStart,
-          periodEnd: period.periodEnd,
-          filingType: period.filingType,
-          filingDate: period.filingDate ? new Date(period.filingDate) : null,
-          accessionNumber: period.accessionNumber,
-        },
-      });
+          update: {
+            periodType: toPrismaPeriodType(period.periodType),
+            periodStart: period.periodStart,
+            periodEnd: period.periodEnd,
+            filingType: period.filingType,
+            filingDate: period.filingDate ? new Date(period.filingDate) : null,
+            accessionNumber: period.accessionNumber,
+          },
+        });
 
-      const incomeInput = toIncomeStatementInput(period);
-      await tx.incomeStatement.upsert({
-        where: { periodId: periodRow.id },
-        create: { periodId: periodRow.id, ...incomeInput },
-        update: incomeInput,
-      });
+        const incomeInput = toIncomeStatementInput(period);
+        await tx.incomeStatement.upsert({
+          where: { periodId: periodRow.id },
+          create: { periodId: periodRow.id, ...incomeInput },
+          update: incomeInput,
+        });
 
-      const balanceInput = toBalanceSheetInput(period);
-      await tx.balanceSheet.upsert({
-        where: { periodId: periodRow.id },
-        create: { periodId: periodRow.id, ...balanceInput },
-        update: balanceInput,
-      });
+        const balanceInput = toBalanceSheetInput(period);
+        await tx.balanceSheet.upsert({
+          where: { periodId: periodRow.id },
+          create: { periodId: periodRow.id, ...balanceInput },
+          update: balanceInput,
+        });
 
-      const cashFlowInput = toCashFlowInput(period);
-      await tx.cashFlowStatement.upsert({
-        where: { periodId: periodRow.id },
-        create: { periodId: periodRow.id, ...cashFlowInput },
-        update: cashFlowInput,
-      });
+        const cashFlowInput = toCashFlowInput(period);
+        await tx.cashFlowStatement.upsert({
+          where: { periodId: periodRow.id },
+          create: { periodId: periodRow.id, ...cashFlowInput },
+          update: cashFlowInput,
+        });
 
-      const rawRows = Object.entries(period.sources).map(([field, source]) => {
-        const meta = FIELD_META.get(field);
-        return {
-          companyId,
-          periodId: periodRow.id,
-          standardizedField: field,
-          statementType: meta?.statementType ?? 'income',
-          xbrlConcept: source.tag,
-          unit: meta?.unit ?? 'USD',
-          value: source.value,
-          periodStart: period.periodStart,
-          periodEnd: period.periodEnd,
-          fiscalYear: period.fiscalYear,
-          fiscalPeriod: period.fiscalPeriod,
-          form: source.filing.form,
-          filedDate: new Date(source.filing.filed),
-          accessionNumber: source.filing.accn,
-        };
-      });
-      if (rawRows.length > 0) {
-        await tx.rawFinancialFact.createMany({ data: rawRows });
+        // Not written here — see allRawRows above and the deleteMany/createMany after the transaction.
+        const rawRows = Object.entries(period.sources).map(([field, source]) => {
+          const meta = FIELD_META.get(field);
+          return {
+            companyId,
+            periodId: periodRow.id,
+            standardizedField: field,
+            statementType: meta?.statementType ?? 'income',
+            xbrlConcept: source.tag,
+            unit: meta?.unit ?? 'USD',
+            value: source.value,
+            periodStart: period.periodStart,
+            periodEnd: period.periodEnd,
+            fiscalYear: period.fiscalYear,
+            fiscalPeriod: period.fiscalPeriod,
+            form: source.filing.form,
+            filedDate: new Date(source.filing.filed),
+            accessionNumber: source.filing.accn,
+          };
+        });
+        allRawRows.push(...rawRows);
       }
-    }
 
-    await tx.company.update({ where: { id: companyId }, data: { financialsSyncedAt: new Date() } });
-  });
+      await tx.company.update({ where: { id: companyId }, data: { financialsSyncedAt: new Date() } });
+    },
+    { timeout: 20000, maxWait: 10000 },
+  );
+
+  // Raw facts are a derived provenance trail, not user-owned data — fully
+  // regenerated every refresh rather than upserted (see the RawFinancialFact
+  // comment in prisma/schema.prisma), and safe to write after the main
+  // transaction has committed since they don't need to be atomic with it
+  // (a next refresh fully regenerates them regardless). Using the pooled
+  // `db` client here, not `dbDirect` — these are simple, independent
+  // statements, exactly what pooling handles well.
+  await db.rawFinancialFact.deleteMany({ where: { companyId } });
+  if (allRawRows.length > 0) {
+    await db.rawFinancialFact.createMany({ data: allRawRows });
+  }
 }
 
 async function logRefresh(
