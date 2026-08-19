@@ -47,9 +47,20 @@ export class SecRequestError extends Error {
 }
 
 function userAgent(): string {
-  return (
-    process.env.SEC_USER_AGENT || 'Atlas Research (dev-fallback, set SEC_USER_AGENT) dev@localhost'
-  );
+  const configured = process.env.SEC_USER_AGENT;
+  if (configured) return configured;
+
+  // The dev fallback below must never be sent to SEC from a real production
+  // deployment — it identifies no one, and SEC will rate-limit or block it,
+  // taking down every SEC-dependent feature (financial statements, filings)
+  // silently. Fail loudly instead of ever making that request unconfigured.
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'SEC_USER_AGENT is not configured. SEC EDGAR requires a real identifying User-Agent in production (e.g. "Your Name your@email.com") — set it before serving traffic.',
+    );
+  }
+
+  return 'Atlas Research (dev-fallback, set SEC_USER_AGENT) dev@localhost';
 }
 
 /** Shared request/retry/error-mapping logic — returns the raw Response so
