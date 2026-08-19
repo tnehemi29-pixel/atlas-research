@@ -78,10 +78,15 @@ describe('dataQualityService', () => {
     expect(outcomes.length).toBeGreaterThan(0);
 
     // SEC filing / earnings freshness are legitimately UNKNOWN (never
-    // "passed") since this fixture has no SecFiling/EarningsCall rows —
-    // everything else (market data freshness, financial-statement
-    // freshness/completeness/reconciliation, market cap reconciliation)
-    // should pass for well-formed, internally-consistent fixture data.
+    // "passed") since this fixture has no SecFiling/EarningsCall rows.
+    // Market cap reconciliation is omitted entirely for this fixture (its
+    // default quoteUpdatedAt is "now", well beyond MARKET_CAP_STALENESS_
+    // THRESHOLD_DAYS from makePeriod's filingDate — correctly `checkable:
+    // false`, so it's absent from `outcomes` rather than present-and-passed;
+    // see dataQualityService.test.ts's market-cap test for that check's own
+    // coverage). Everything else (market data freshness, financial-statement
+    // freshness/completeness/reconciliation) should pass for well-formed,
+    // internally-consistent fixture data.
     const checkable = outcomes.filter((o) => !(o.dimension === 'FRESHNESS' && o.freshnessStatus === 'UNKNOWN'));
     expect(checkable.length).toBeGreaterThan(0);
     expect(checkable.every((o) => o.passed)).toBe(true);
@@ -100,7 +105,11 @@ describe('dataQualityService', () => {
   });
 
   it('flags market cap reconciliation failure when marketCap does not equal price x shares', async () => {
-    const company = await makeCompany({ price: 100, marketCap: 5_000_000_000 }); // should be ~1B
+    // quoteUpdatedAt close to the period's filingDate (2026-02-01, from
+    // makePeriod below) so this test exercises the numeric-mismatch check,
+    // not the separate freshness-staleness guard (marketDataValidation.test.ts
+    // covers that directly).
+    const company = await makeCompany({ price: 100, marketCap: 5_000_000_000, quoteUpdatedAt: new Date('2026-02-10') }); // should be ~1B
     await makePeriod(company.id, 2025);
 
     const outcomes = await runDataQualityChecks(company.id);

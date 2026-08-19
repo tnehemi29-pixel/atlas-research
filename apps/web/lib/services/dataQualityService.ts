@@ -150,6 +150,8 @@ export async function runDataQualityChecks(companyId: string): Promise<DataQuali
     sharePrice: company.price,
     sharesOutstanding: latest?.incomeStatement?.dilutedSharesOutstanding ?? null,
     marketCap: company.marketCap,
+    quoteUpdatedAt: company.quoteUpdatedAt,
+    filingDate: latest?.filingDate ?? null,
   });
   if (marketCapCheck.checkable) {
     outcomes.push({
