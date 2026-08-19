@@ -10,7 +10,7 @@ import type {
   FiscalPeriod as ApiFiscalPeriod,
   PeriodType as ApiPeriodType,
 } from '@erp/types';
-import { db } from '@/lib/db';
+import { db, dbDirect } from '@/lib/db';
 import { ensureCompanyByTicker } from '@/lib/services/companyService';
 import { getCompanyFacts, resolveCik } from '@/lib/providers/secEdgar';
 import { normalizeCompanyFacts } from '@/lib/xbrl/normalize';
@@ -66,7 +66,12 @@ function findPreviousSameType(
 }
 
 async function persistPeriods(companyId: string, periods: NormalizedPeriod[]): Promise<void> {
-  await db.$transaction(async (tx) => {
+  // Runs over the direct (non-pooled) connection — this is a genuinely
+  // multi-statement interactive transaction (a deleteMany, then several
+  // upserts per period), which needs one connection held open throughout;
+  // the pooled `db` client's PgBouncer transaction-mode endpoint doesn't
+  // support that. See lib/db.ts's dbDirect for the full explanation.
+  await dbDirect.$transaction(async (tx) => {
     // Raw facts are fully regenerated every refresh rather than upserted —
     // simpler and correct since they're a derived provenance trail, not
     // user-owned data. See prisma/schema.prisma's RawFinancialFact comment.
