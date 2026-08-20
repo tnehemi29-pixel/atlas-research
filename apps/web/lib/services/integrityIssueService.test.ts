@@ -109,6 +109,104 @@ describe('integrityIssueService', () => {
     });
   });
 
+  // The exact lifecycle behind the stale-DCF-WACC-message report: the same
+  // dedupeKey keeps failing, but the audit module's own message for it
+  // becomes more specific over time (e.g. a generic "WACC could not be
+  // calculated" becomes "Historical cost of debt is unavailable..."). The
+  // issue must stay OPEN throughout — this is a description refresh, never
+  // a resolution.
+  describe('description refresh on a still-failing finding', () => {
+    it('updates the description of an OPEN issue when the same dedupeKey fails again with different text — status remains OPEN', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: 'dcf:DCF validation: wacc', description: 'WACC could not be calculated — check that market cap, total debt, and cost of equity/debt inputs are all provided.' })]);
+
+      const result = await syncIssuesFromFindings(company.id, [
+        makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: 'dcf:DCF validation: wacc', description: 'Historical cost of debt is unavailable for this company (interest expense is not broken out in its recent filings) — select a manual cost-of-debt assumption to calculate WACC.' }),
+      ]);
+      expect(result.descriptionUpdated).toBe(1);
+      expect(result.created).toBe(0);
+      expect(result.autoResolved).toBe(0);
+
+      const issues = await listIntegrityIssues(company.id, { status: 'OPEN' });
+      expect(issues).toHaveLength(1);
+      expect(issues[0]!.status).toBe('OPEN'); // never resolved, never reopened — it was already open
+      expect(issues[0]!.description).toMatch(/Historical cost of debt is unavailable/);
+      expect(issues[0]!.category).toBe('DCF_MODEL_ERROR'); // unchanged
+      expect(issues[0]!.severity).toBe('MEDIUM'); // unchanged — makeFinding's default, never rewritten by this path
+    });
+
+    it('updates the description of an ACKNOWLEDGED issue the same way — status remains ACKNOWLEDGED', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeFinding({ dedupeKey: 'dcf:ack-case', description: 'old message' })]);
+      const created = (await listIntegrityIssues(company.id))[0]!;
+      await acknowledgeIntegrityIssue(created.id, 'user-1');
+
+      const result = await syncIssuesFromFindings(company.id, [makeFinding({ dedupeKey: 'dcf:ack-case', description: 'new, more specific message' })]);
+      expect(result.descriptionUpdated).toBe(1);
+
+      const issue = await getIntegrityIssue(created.id);
+      expect(issue.status).toBe('ACKNOWLEDGED'); // unchanged
+      expect(issue.description).toBe('new, more specific message');
+      expect(issue.acknowledgedByUserId).toBe('user-1'); // untouched by the description refresh
+    });
+
+    it('does not write anything when the description is identical — no unnecessary update', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeFinding({ dedupeKey: 'dcf:same-text', description: 'same message every time' })]);
+
+      const result = await syncIssuesFromFindings(company.id, [makeFinding({ dedupeKey: 'dcf:same-text', description: 'same message every time' })]);
+      expect(result.descriptionUpdated).toBe(0);
+      expect(result.created).toBe(0);
+    });
+
+    it('never rewrites or reopens a RESOLVED issue when the same problem recurs with new text', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeFinding({ category: 'FINANCIAL_RECONCILIATION', dedupeKey: 'dcf:resolved-case', description: 'old message' })]);
+      const created = (await listIntegrityIssues(company.id))[0]!;
+      await resolveIntegrityIssue(created.id, 'user-1', 'Confirmed a data-provider rounding difference.');
+
+      const result = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'FINANCIAL_RECONCILIATION', dedupeKey: 'dcf:resolved-case', description: 'new message, still failing' })]);
+      expect(result.descriptionUpdated).toBe(0);
+      expect(result.created).toBe(0); // dedupeKey already exists — never a second issue
+
+      const issue = await getIntegrityIssue(created.id);
+      expect(issue.status).toBe('RESOLVED'); // never reopened
+      expect(issue.description).toBe('old message'); // never rewritten
+    });
+
+    it('never rewrites or reopens an IGNORED issue when the same problem recurs with new text', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeFinding({ dedupeKey: 'dcf:ignored-case', description: 'old message' })]);
+      const created = (await listIntegrityIssues(company.id))[0]!;
+      await ignoreIntegrityIssue(created.id, 'user-1', 'Known false positive for this filer.');
+
+      const result = await syncIssuesFromFindings(company.id, [makeFinding({ dedupeKey: 'dcf:ignored-case', description: 'new message, still failing' })]);
+      expect(result.descriptionUpdated).toBe(0);
+
+      const issue = await getIntegrityIssue(created.id);
+      expect(issue.status).toBe('IGNORED'); // never reopened
+      expect(issue.description).toBe('old message'); // never rewritten
+    });
+
+    it('only touches the dedupeKey whose description actually changed — an unrelated OPEN issue in the same sync is unaffected', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [
+        makeFinding({ dedupeKey: 'dcf:changed', description: 'old' }),
+        makeFinding({ category: 'FINANCIAL_RECONCILIATION', dedupeKey: 'dcf:unchanged', description: 'stable message' }),
+      ]);
+
+      const result = await syncIssuesFromFindings(company.id, [
+        makeFinding({ dedupeKey: 'dcf:changed', description: 'new' }),
+        makeFinding({ category: 'FINANCIAL_RECONCILIATION', dedupeKey: 'dcf:unchanged', description: 'stable message' }),
+      ]);
+      expect(result.descriptionUpdated).toBe(1);
+
+      const issues = await listIntegrityIssues(company.id, { status: 'OPEN' });
+      const unchanged = issues.find((i) => i.dedupeKey === 'dcf:unchanged');
+      expect(unchanged?.description).toBe('stable message');
+    });
+  });
+
   // The exact lifecycle behind the stale-market-cap-finding fix: a check
   // that used to be checkable-and-failing can become checkable: false
   // (e.g. checkMarketCapReconciliation's 45-day freshness guard) — the

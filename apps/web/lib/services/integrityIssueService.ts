@@ -79,12 +79,20 @@ export interface SyncIssuesResult {
    * RESOLVED — "no longer checkable" is never the same fact as "verified
    * and passed." */
   autoClosedUnverifiable: number;
+  /** An existing OPEN/ACKNOWLEDGED issue for the same still-failing finding
+   * whose description text changed (e.g. a validation message became more
+   * specific) — only `description` is rewritten; status, detectedAt,
+   * category, severity, and dedupeKey are all left exactly as they were.
+   * Never fires for RESOLVED/IGNORED issues, and never fires when the text
+   * is unchanged (no unnecessary write). */
+  descriptionUpdated: number;
 }
 
 export async function syncIssuesFromFindings(companyId: string, findings: FindingForIssueSync[]): Promise<SyncIssuesResult> {
   let created = 0;
   let autoResolved = 0;
   let autoClosedUnverifiable = 0;
+  let descriptionUpdated = 0;
 
   // A dedupeKey that was OPEN/ACKNOWLEDGED before but is entirely absent
   // from `findings` this run means its check could no longer run at all —
@@ -131,12 +139,30 @@ export async function syncIssuesFromFindings(companyId: string, findings: Findin
         });
         created += 1;
         await writeAuditLogEntry({ companyId, entityType: 'ResearchIntegrityIssue', entityId: issue.id, action: 'ISSUE_CREATED', detail: { category: finding.category, severity: finding.severity, description: finding.description } });
+      } else if ((existing.status === 'OPEN' || existing.status === 'ACKNOWLEDGED') && existing.description !== finding.description) {
+        // Same finding, still failing, still OPEN/ACKNOWLEDGED — only its
+        // description text changed (e.g. a validation message became more
+        // specific about which input is actually missing). Status,
+        // detectedAt, category, severity, and dedupeKey are all left exactly
+        // as they were; this is the same detection, not a new one, and it
+        // must stay OPEN because the underlying problem is still real and
+        // unresolved. A RESOLVED/IGNORED issue is never touched here — the
+        // status check above excludes it, same as the rest of this file's
+        // "never silently reopen or rewrite" discipline.
+        await db.researchIntegrityIssue.update({ where: { id: existing.id }, data: { description: finding.description } });
+        descriptionUpdated += 1;
+        await writeAuditLogEntry({
+          companyId,
+          entityType: 'ResearchIntegrityIssue',
+          entityId: existing.id,
+          action: 'CHECK_RUN',
+          detail: { reason: 'description-refreshed', previousDescription: existing.description, newDescription: finding.description },
+        });
       }
-      // An existing OPEN/ACKNOWLEDGED issue is left exactly as-is — never
-      // silently rewritten. A RESOLVED/IGNORED issue whose problem recurs is
-      // also left as-is (not automatically reopened) — a documented, narrow
-      // scoping decision (see docs/research-integrity.md) rather than a
-      // second, competing "was this actually fixed" heuristic.
+      // A RESOLVED/IGNORED issue whose problem recurs is left as-is (not
+      // automatically reopened) — a documented, narrow scoping decision (see
+      // docs/research-integrity.md) rather than a second, competing "was
+      // this actually fixed" heuristic.
       continue;
     }
 
@@ -150,7 +176,7 @@ export async function syncIssuesFromFindings(companyId: string, findings: Findin
     }
   }
 
-  return { created, autoResolved, autoClosedUnverifiable };
+  return { created, autoResolved, autoClosedUnverifiable, descriptionUpdated };
 }
 
 export interface ListIntegrityIssuesFilters {
