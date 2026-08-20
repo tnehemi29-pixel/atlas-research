@@ -58,6 +58,26 @@ export const AUTO_RESOLVABLE_CATEGORIES: ReadonlySet<IntegrityIssueCategory> = n
  */
 export const AUTO_CLOSE_WHEN_UNVERIFIABLE_CATEGORIES: ReadonlySet<IntegrityIssueCategory> = new Set<IntegrityIssueCategory>(['MARKET_DATA_INTEGRITY']);
 
+/**
+ * A third, deliberately separate exception from the two category-wide rules
+ * above — keyed by dedupeKey, not category, so it can never widen to any
+ * other DCF/comps finding. DCF_MODEL_ERROR stays excluded from
+ * AUTO_RESOLVABLE_CATEGORIES in general: most findings in that category
+ * (terminal-growth-vs-WACC, EV/equity-value reconciliation) could start
+ * passing because of ordinary data drift, which still warrants a human
+ * look. This one exact finding is different — it exists solely because a
+ * required WACC input (Company.costOfDebtOverride) was missing, and it can
+ * only start passing because a human explicitly supplied that exact input
+ * via the Valuation page's Save action
+ * (lib/services/valuationOverrideService.ts). There is no ambiguity to
+ * defer to a human about. The string must match exactly what
+ * integritySnapshotService.ts's modelFindingToIssue generates
+ * (`dedupeKey: "dcf:" + finding.check`) for lib/integrity/dcfAudit.ts's
+ * checkDcfOwnValidation's wacc finding (`check: "DCF validation: wacc"`) —
+ * verified directly against that code, not assumed.
+ */
+export const AUTO_RESOLVABLE_FINDING_KEYS: ReadonlySet<string> = new Set<string>(['dcf:DCF validation: wacc']);
+
 export interface FindingForIssueSync {
   category: IntegrityIssueCategory;
   severity: IntegrityIssueSeverity;
@@ -86,6 +106,12 @@ export interface SyncIssuesResult {
    * Never fires for RESOLVED/IGNORED issues, and never fires when the text
    * is unchanged (no unnecessary write). */
   descriptionUpdated: number;
+  /** An issue previously auto-resolved via AUTO_RESOLVABLE_FINDING_KEYS,
+   * reopened because the same exact finding is failing again — see the
+   * "reopen" branch in the main loop below. Never fires for a RESOLVED
+   * issue a human resolved (resolvedByUserId is set in that case — see
+   * resolveIntegrityIssue) or for any IGNORED issue. */
+  autoReopened: number;
 }
 
 export async function syncIssuesFromFindings(companyId: string, findings: FindingForIssueSync[]): Promise<SyncIssuesResult> {
@@ -93,6 +119,7 @@ export async function syncIssuesFromFindings(companyId: string, findings: Findin
   let autoResolved = 0;
   let autoClosedUnverifiable = 0;
   let descriptionUpdated = 0;
+  let autoReopened = 0;
 
   // A dedupeKey that was OPEN/ACKNOWLEDGED before but is entirely absent
   // from `findings` this run means its check could no longer run at all —
@@ -158,25 +185,71 @@ export async function syncIssuesFromFindings(companyId: string, findings: Findin
           action: 'CHECK_RUN',
           detail: { reason: 'description-refreshed', previousDescription: existing.description, newDescription: finding.description },
         });
+      } else if (
+        existing.status === 'RESOLVED' &&
+        existing.resolvedByUserId === null && // set only by resolveIntegrityIssue's human-invoked path — null here means this row was auto-resolved, never a person's judgment call
+        AUTO_RESOLVABLE_FINDING_KEYS.has(existing.dedupeKey)
+      ) {
+        // The narrow, symmetric counterpart to the auto-resolve branch
+        // below: this exact finding (currently only "dcf:DCF validation:
+        // wacc") was auto-resolved because a human explicitly supplied the
+        // missing input, and is now failing again — most likely because
+        // that same input was cleared. Reopening is exactly as
+        // mechanically unambiguous as the original auto-resolve was, so
+        // this narrowly-scoped case is the one deliberate exception to
+        // "never reopen a RESOLVED issue": it only fires when
+        // resolvedByUserId is null (never for resolveIntegrityIssue's
+        // human path) and only for dedupeKeys in
+        // AUTO_RESOLVABLE_FINDING_KEYS — every other RESOLVED issue,
+        // auto-resolved or not, is left exactly as before.
+        await db.researchIntegrityIssue.update({
+          where: { id: existing.id },
+          data: {
+            status: 'OPEN',
+            severity: finding.severity,
+            description: finding.description,
+            resolution: null,
+            resolvedAt: null,
+          },
+        });
+        autoReopened += 1;
+        await writeAuditLogEntry({
+          companyId,
+          entityType: 'ResearchIntegrityIssue',
+          entityId: existing.id,
+          action: 'ISSUE_CREATED',
+          detail: { reason: 'auto-reopened', dedupeKey: existing.dedupeKey, previousResolution: existing.resolution, newDescription: finding.description },
+        });
       }
-      // A RESOLVED/IGNORED issue whose problem recurs is left as-is (not
-      // automatically reopened) — a documented, narrow scoping decision (see
-      // docs/research-integrity.md) rather than a second, competing "was
-      // this actually fixed" heuristic.
+      // Every other RESOLVED/IGNORED issue whose problem recurs is left
+      // as-is (not automatically reopened) — a documented, narrow scoping
+      // decision (see docs/research-integrity.md) rather than a second,
+      // competing "was this actually fixed" heuristic. The branch above is
+      // the one deliberate, narrowly-scoped exception.
       continue;
     }
 
-    if (existing && (existing.status === 'OPEN' || existing.status === 'ACKNOWLEDGED') && AUTO_RESOLVABLE_CATEGORIES.has(existing.category)) {
-      await db.researchIntegrityIssue.update({
-        where: { id: existing.id },
-        data: { status: 'RESOLVED', resolution: 'Automatically resolved — the underlying check now passes.', resolvedAt: new Date() },
-      });
-      autoResolved += 1;
-      await writeAuditLogEntry({ companyId, entityType: 'ResearchIntegrityIssue', entityId: existing.id, action: 'ISSUE_AUTO_RESOLVED', detail: { category: existing.category } });
+    if (existing && (existing.status === 'OPEN' || existing.status === 'ACKNOWLEDGED')) {
+      const viaCategory = AUTO_RESOLVABLE_CATEGORIES.has(existing.category);
+      const viaFindingKey = AUTO_RESOLVABLE_FINDING_KEYS.has(existing.dedupeKey);
+      if (viaCategory || viaFindingKey) {
+        await db.researchIntegrityIssue.update({
+          where: { id: existing.id },
+          data: { status: 'RESOLVED', resolution: 'Automatically resolved — the underlying check now passes.', resolvedAt: new Date() },
+        });
+        autoResolved += 1;
+        await writeAuditLogEntry({
+          companyId,
+          entityType: 'ResearchIntegrityIssue',
+          entityId: existing.id,
+          action: 'ISSUE_AUTO_RESOLVED',
+          detail: { category: existing.category, via: viaCategory ? 'category' : 'findingKey' },
+        });
+      }
     }
   }
 
-  return { created, autoResolved, autoClosedUnverifiable, descriptionUpdated };
+  return { created, autoResolved, autoClosedUnverifiable, descriptionUpdated, autoReopened };
 }
 
 export interface ListIntegrityIssuesFilters {

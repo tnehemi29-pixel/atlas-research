@@ -282,6 +282,288 @@ describe('integrityIssueService', () => {
     });
   });
 
+  // The exact lifecycle behind the cost-of-debt-override fix: unlike other
+  // DCF_MODEL_ERROR findings (deliberately excluded from
+  // AUTO_RESOLVABLE_CATEGORIES — most could start passing from ordinary data
+  // drift, which still warrants a human), the "dcf:DCF validation: wacc"
+  // finding is mechanically unambiguous once a human explicitly saves a
+  // Company.costOfDebtOverride: it can only start passing because of that
+  // exact, explicit action. AUTO_RESOLVABLE_FINDING_KEYS is a narrow,
+  // dedupeKey-scoped exception — never touches AUTO_RESOLVABLE_CATEGORIES or
+  // AUTO_CLOSE_WHEN_UNVERIFIABLE_CATEGORIES.
+  describe('auto-resolve the exact wacc finding (AUTO_RESOLVABLE_FINDING_KEYS)', () => {
+    const WACC_DEDUPE_KEY = 'dcf:DCF validation: wacc';
+
+    it('A/creates an OPEN "dcf:DCF validation: wacc" issue when the finding fails', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      const result = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', severity: 'CRITICAL', dedupeKey: WACC_DEDUPE_KEY })]);
+      expect(result.created).toBe(1);
+
+      const issues = await listIntegrityIssues(company.id, { status: 'OPEN' });
+      expect(issues).toHaveLength(1);
+      expect(issues[0]!.dedupeKey).toBe(WACC_DEDUPE_KEY);
+      expect(issues[0]!.category).toBe('DCF_MODEL_ERROR');
+    });
+
+    it('C/resolves an existing OPEN wacc issue once the same finding passes', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', severity: 'CRITICAL', dedupeKey: WACC_DEDUPE_KEY })]);
+
+      const result = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY, passed: true })]);
+      expect(result.autoResolved).toBe(1);
+
+      const resolved = await listIntegrityIssues(company.id, { status: 'RESOLVED' });
+      expect(resolved).toHaveLength(1);
+      expect(resolved[0]!.dedupeKey).toBe(WACC_DEDUPE_KEY);
+      expect(resolved[0]!.resolution).toMatch(/Automatically resolved/);
+
+      const openOrAcknowledged = await listIntegrityIssues(company.id, { status: 'OPEN' });
+      expect(openOrAcknowledged).toHaveLength(0); // gone from the OPEN list
+    });
+
+    it('D/resolves an existing ACKNOWLEDGED wacc issue once the same finding passes', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY })]);
+      const created = (await listIntegrityIssues(company.id))[0]!;
+      await acknowledgeIntegrityIssue(created.id, 'user-1');
+
+      const result = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY, passed: true })]);
+      expect(result.autoResolved).toBe(1);
+
+      const issue = await getIntegrityIssue(created.id);
+      expect(issue.status).toBe('RESOLVED');
+    });
+
+    it('E/never re-resolves or rewrites an already-RESOLVED wacc issue', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY })]);
+      const created = (await listIntegrityIssues(company.id))[0]!;
+      await resolveIntegrityIssue(created.id, 'user-1', 'Manually verified against the filing.');
+
+      const result = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY, passed: true })]);
+      expect(result.autoResolved).toBe(0); // status check excludes RESOLVED — never touched again
+
+      const issue = await getIntegrityIssue(created.id);
+      expect(issue.status).toBe('RESOLVED');
+      expect(issue.resolution).toBe('Manually verified against the filing.'); // untouched
+    });
+
+    it('F/never reopens or rewrites an already-IGNORED wacc issue', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY })]);
+      const created = (await listIntegrityIssues(company.id))[0]!;
+      await ignoreIntegrityIssue(created.id, 'user-1', 'Known false positive for this filer.');
+
+      const result = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY, passed: true })]);
+      expect(result.autoResolved).toBe(0);
+
+      const issue = await getIntegrityIssue(created.id);
+      expect(issue.status).toBe('IGNORED');
+    });
+
+    it('G/does not auto-resolve a different DCF_MODEL_ERROR finding, even when it passes', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: 'dcf:Terminal growth < WACC' })]);
+
+      const result = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: 'dcf:Terminal growth < WACC', passed: true })]);
+      expect(result.autoResolved).toBe(0);
+
+      const issues = await listIntegrityIssues(company.id, { status: 'OPEN' });
+      expect(issues).toHaveLength(1); // still open — requires a human, exactly like before this fix
+    });
+
+    it('H/leaves an OPEN wacc issue untouched when the finding is absent entirely (the whole DCF audit could not run)', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY })]);
+
+      // Mirrors runDcfModelAudit returning null (no overview / no financial
+      // periods): the wacc dedupeKey is not present in findings at all —
+      // this must never be treated the same as "present and passing".
+      const result = await syncIssuesFromFindings(company.id, []);
+      expect(result.autoResolved).toBe(0);
+      expect(result.autoClosedUnverifiable).toBe(0); // DCF_MODEL_ERROR is not in AUTO_CLOSE_WHEN_UNVERIFIABLE_CATEGORIES
+
+      const issues = await listIntegrityIssues(company.id, { status: 'OPEN' });
+      expect(issues).toHaveLength(1);
+      expect(issues[0]!.dedupeKey).toBe(WACC_DEDUPE_KEY);
+    });
+
+    it('I/leaves DATA_FRESHNESS and DATA_COMPLETENESS auto-resolution unchanged', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [
+        makeFinding({ category: 'DATA_FRESHNESS', dedupeKey: 'freshness:unchanged-check' }),
+        makeFinding({ category: 'DATA_COMPLETENESS', dedupeKey: 'completeness:unchanged-check' }),
+      ]);
+
+      const result = await syncIssuesFromFindings(company.id, [
+        makeFinding({ category: 'DATA_FRESHNESS', dedupeKey: 'freshness:unchanged-check', passed: true }),
+        makeFinding({ category: 'DATA_COMPLETENESS', dedupeKey: 'completeness:unchanged-check', passed: true }),
+      ]);
+      expect(result.autoResolved).toBe(2);
+
+      const resolved = await listIntegrityIssues(company.id, { status: 'RESOLVED' });
+      expect(resolved).toHaveLength(2);
+    });
+
+    it('J/the dedupeKey used for auto-resolution matches exactly what the current findings-to-issue mapping generates ("dcf:" + the DCF audit\'s own check string)', async () => {
+      // integritySnapshotService.ts's modelFindingToIssue: dedupeKey: `${'dcf'}:${finding.check}`,
+      // and lib/integrity/dcfAudit.ts's checkDcfOwnValidation emits check: 'DCF validation: wacc' —
+      // asserting the literal composed string here so a rename of either half fails this test loudly
+      // instead of silently breaking the auto-resolve allowlist match.
+      expect(WACC_DEDUPE_KEY).toBe('dcf:DCF validation: wacc');
+
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      const created = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY })]);
+      expect(created.created).toBe(1);
+      const issue = (await listIntegrityIssues(company.id))[0]!;
+      expect(issue.dedupeKey).toBe(WACC_DEDUPE_KEY); // unchanged by this fix
+
+      const resolvedRun = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY, passed: true })]);
+      expect(resolvedRun.autoResolved).toBe(1); // the exact same string is what the allowlist matches against
+    });
+
+    // The symmetric counterpart: a saved Company.costOfDebtOverride can be
+    // cleared just as explicitly as it was saved. Distinguishing "auto"
+    // from "human" resolution reuses the existing resolvedByUserId field
+    // (set only by resolveIntegrityIssue's human-invoked path — see that
+    // function above) rather than inventing a new column or inferring from
+    // resolution text.
+    describe('auto-reopen when the same wacc finding fails again', () => {
+      it('1/creates then auto-resolves the wacc issue once the finding passes (baseline for the reopen tests below)', async () => {
+        const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+        const createResult = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', severity: 'CRITICAL', dedupeKey: WACC_DEDUPE_KEY })]);
+        expect(createResult.created).toBe(1);
+
+        const resolveResult = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY, passed: true })]);
+        expect(resolveResult.autoResolved).toBe(1);
+
+        const issue = (await listIntegrityIssues(company.id))[0]!;
+        expect(issue.status).toBe('RESOLVED');
+        expect(issue.resolvedByUserId).toBeNull(); // auto-resolved, not a human decision
+      });
+
+      it('2/reopens a previously auto-resolved wacc issue to OPEN when the same finding fails again', async () => {
+        const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+        await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', severity: 'CRITICAL', dedupeKey: WACC_DEDUPE_KEY })]);
+        await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY, passed: true })]);
+        const resolvedId = (await listIntegrityIssues(company.id))[0]!.id;
+
+        const reopenResult = await syncIssuesFromFindings(company.id, [
+          makeFinding({ category: 'DCF_MODEL_ERROR', severity: 'CRITICAL', dedupeKey: WACC_DEDUPE_KEY, description: 'Historical cost of debt is unavailable for this company — select a manual cost-of-debt assumption to calculate WACC.' }),
+        ]);
+        expect(reopenResult.autoReopened).toBe(1);
+        expect(reopenResult.created).toBe(0); // the same row, never a duplicate
+
+        const issue = await getIntegrityIssue(resolvedId);
+        expect(issue.status).toBe('OPEN');
+        expect(issue.dedupeKey).toBe(WACC_DEDUPE_KEY);
+      });
+
+      it('3/never reopens a manually (human) RESOLVED wacc issue when the finding fails again', async () => {
+        const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+        await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY })]);
+        const created = (await listIntegrityIssues(company.id))[0]!;
+        await resolveIntegrityIssue(created.id, 'user-1', 'Manually verified the analyst\'s assumption directly with the filing.');
+
+        const result = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY })]); // failing again
+        expect(result.autoReopened).toBe(0);
+        expect(result.created).toBe(0);
+
+        const issue = await getIntegrityIssue(created.id);
+        expect(issue.status).toBe('RESOLVED'); // never reopened — resolvedByUserId was set
+        expect(issue.resolution).toBe('Manually verified the analyst\'s assumption directly with the filing.'); // untouched
+      });
+
+      it('4/never reopens an IGNORED wacc issue when the finding fails again', async () => {
+        const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+        await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY })]);
+        const created = (await listIntegrityIssues(company.id))[0]!;
+        await ignoreIntegrityIssue(created.id, 'user-1', 'Known false positive for this filer.');
+
+        const result = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY })]);
+        expect(result.autoReopened).toBe(0);
+
+        const issue = await getIntegrityIssue(created.id);
+        expect(issue.status).toBe('IGNORED'); // never reopened or modified
+      });
+
+      it('5/a reopened issue reflects the current failing finding\'s description and severity', async () => {
+        const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+        await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', severity: 'MEDIUM', dedupeKey: WACC_DEDUPE_KEY, description: 'old blocking message' })]);
+        await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY, passed: true })]);
+        const resolvedId = (await listIntegrityIssues(company.id))[0]!.id;
+
+        await syncIssuesFromFindings(company.id, [
+          makeFinding({ category: 'DCF_MODEL_ERROR', severity: 'CRITICAL', dedupeKey: WACC_DEDUPE_KEY, description: 'current blocking message after the override was cleared' }),
+        ]);
+
+        const issue = await getIntegrityIssue(resolvedId);
+        expect(issue.status).toBe('OPEN');
+        expect(issue.severity).toBe('CRITICAL');
+        expect(issue.description).toBe('current blocking message after the override was cleared');
+        expect(issue.resolution).toBeNull(); // cleared on reopen
+        expect(issue.resolvedAt).toBeNull(); // cleared on reopen
+      });
+
+      it('6/does not create a duplicate issue when reopening — exactly one row for the dedupeKey throughout', async () => {
+        const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+        await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY })]);
+        await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY, passed: true })]);
+        await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY })]);
+
+        const all = await db.researchIntegrityIssue.findMany({ where: { companyId: company.id, dedupeKey: WACC_DEDUPE_KEY } });
+        expect(all).toHaveLength(1);
+      });
+
+      it('7/does not affect a different DCF_MODEL_ERROR finding\'s issue when the wacc issue reopens in the same sync', async () => {
+        const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+        await syncIssuesFromFindings(company.id, [
+          makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY }),
+          makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: 'dcf:Terminal growth < WACC' }),
+        ]);
+        await syncIssuesFromFindings(company.id, [
+          makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY, passed: true }),
+          makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: 'dcf:Terminal growth < WACC' }), // still failing throughout, untouched
+        ]);
+
+        const result = await syncIssuesFromFindings(company.id, [
+          makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY }), // fails again -> reopens
+          makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: 'dcf:Terminal growth < WACC' }),
+        ]);
+        expect(result.autoReopened).toBe(1);
+
+        const terminalGrowthIssue = await db.researchIntegrityIssue.findUnique({ where: { companyId_dedupeKey: { companyId: company.id, dedupeKey: 'dcf:Terminal growth < WACC' } } });
+        expect(terminalGrowthIssue?.status).toBe('OPEN'); // was already OPEN the whole time — unaffected by the wacc reopen
+      });
+
+      it('8/does not affect the unrelated market-cap integrity issue', async () => {
+        const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+        await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY }), makeMarketCapFinding()]);
+        await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY, passed: true }), makeMarketCapFinding()]);
+        const marketCapBefore = await db.researchIntegrityIssue.findUnique({ where: { companyId_dedupeKey: { companyId: company.id, dedupeKey: MARKET_CAP_DEDUPE_KEY } } });
+
+        const result = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY }), makeMarketCapFinding()]);
+        expect(result.autoReopened).toBe(1);
+
+        const marketCapAfter = await db.researchIntegrityIssue.findUnique({ where: { companyId_dedupeKey: { companyId: company.id, dedupeKey: MARKET_CAP_DEDUPE_KEY } } });
+        expect(marketCapAfter).toEqual(marketCapBefore); // byte-for-byte unchanged
+      });
+
+      it('9/existing description-refresh behavior for a still-OPEN wacc issue remains intact (never treated as a reopen)', async () => {
+        const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+        await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY, description: 'generic message' })]);
+
+        const result = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DCF_MODEL_ERROR', dedupeKey: WACC_DEDUPE_KEY, description: 'more specific message' })]);
+        expect(result.descriptionUpdated).toBe(1);
+        expect(result.autoReopened).toBe(0); // it was already OPEN — this is a refresh, not a reopen
+
+        const issue = (await listIntegrityIssues(company.id))[0]!;
+        expect(issue.status).toBe('OPEN');
+        expect(issue.description).toBe('more specific message');
+      });
+    });
+  });
+
   describe('acknowledge / resolve / ignore workflow', () => {
     it('acknowledges an issue and records the acting user', async () => {
       const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
