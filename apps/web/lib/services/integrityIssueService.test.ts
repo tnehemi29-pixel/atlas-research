@@ -12,6 +12,21 @@ import {
   type FindingForIssueSync,
 } from './integrityIssueService';
 
+const MARKET_CAP_DEDUPE_KEY = 'dq:MARKET_DATA:CALCULATION_INTEGRITY:Market cap (Price × Shares Outstanding)';
+
+function makeMarketCapFinding(overrides: Partial<FindingForIssueSync> = {}): FindingForIssueSync {
+  return {
+    category: 'MARKET_DATA_INTEGRITY',
+    severity: 'HIGH',
+    datasetType: 'MARKET_DATA',
+    description: 'Market cap (Price × Shares Outstanding) does not reconcile: reported 4,647,666,932,640 vs. expected 4,748,086,318,680.',
+    source: 'dataQualityService',
+    dedupeKey: MARKET_CAP_DEDUPE_KEY,
+    passed: false,
+    ...overrides,
+  };
+}
+
 const TICKER = 'ZZIIS1';
 
 async function cleanup() {
@@ -91,6 +106,81 @@ describe('integrityIssueService', () => {
         const result = await syncIssuesFromFindings(company.id, [makeFinding({ category, dedupeKey: `never:${category}`, passed: true })]);
         expect(result.autoResolved).toBe(0);
       }
+    });
+  });
+
+  // The exact lifecycle behind the stale-market-cap-finding fix: a check
+  // that used to be checkable-and-failing can become checkable: false
+  // (e.g. checkMarketCapReconciliation's 45-day freshness guard) — the
+  // resulting finding then simply disappears from the findings array
+  // passed to syncIssuesFromFindings, rather than reporting `passed: true`.
+  describe('close-when-unverifiable (MARKET_DATA_INTEGRITY)', () => {
+    it('creates an OPEN market-cap issue when the check is checkable and fails', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      const result = await syncIssuesFromFindings(company.id, [makeMarketCapFinding()]);
+      expect(result.created).toBe(1);
+
+      const issues = await listIntegrityIssues(company.id, { status: 'OPEN' });
+      expect(issues).toHaveLength(1);
+      expect(issues[0]!.category).toBe('MARKET_DATA_INTEGRITY');
+    });
+
+    it('auto-closes (IGNORED, not RESOLVED) an OPEN market-cap issue whose finding disappears entirely — never leaves it OPEN indefinitely', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeMarketCapFinding()]);
+
+      // The next run: the check is now checkable: false, so dataQualityService
+      // omits it from the findings array entirely — not present, not passing.
+      const result = await syncIssuesFromFindings(company.id, []);
+      expect(result.autoClosedUnverifiable).toBe(1);
+      expect(result.autoResolved).toBe(0); // never RESOLVED — that would claim it was verified correct
+
+      const stillOpen = await listIntegrityIssues(company.id, { status: 'OPEN' });
+      expect(stillOpen).toHaveLength(0);
+
+      const ignored = await listIntegrityIssues(company.id, { status: 'IGNORED' });
+      expect(ignored).toHaveLength(1);
+      expect(ignored[0]!.ignoreReason).toMatch(/can no longer verify/);
+      expect(ignored[0]!.ignoreReason).toMatch(/not a confirmation/i); // explicitly disclaims "verified correct", never asserts it
+      expect(ignored[0]!.status).toBe('IGNORED'); // never RESOLVED — RESOLVED would claim it was verified correct
+    });
+
+    it('leaves a genuinely still-failing market-cap issue OPEN — the close-when-unverifiable path only fires when the finding is absent, not when it is present and still failing', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeMarketCapFinding()]);
+
+      // Still checkable, still fails — present in findings, unlike the test above.
+      const result = await syncIssuesFromFindings(company.id, [makeMarketCapFinding()]);
+      expect(result.autoClosedUnverifiable).toBe(0);
+      expect(result.created).toBe(0); // dedupeKey already exists — no duplicate
+
+      const issues = await listIntegrityIssues(company.id, { status: 'OPEN' });
+      expect(issues).toHaveLength(1);
+    });
+
+    it('does not affect an unrelated category\'s existing auto-resolution when both are synced together', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeMarketCapFinding(), makeFinding({ category: 'DATA_FRESHNESS', dedupeKey: 'freshness:combo' })]);
+
+      // Market cap disappears (checkable: false); the freshness finding now passes.
+      const result = await syncIssuesFromFindings(company.id, [makeFinding({ category: 'DATA_FRESHNESS', dedupeKey: 'freshness:combo', passed: true })]);
+      expect(result.autoClosedUnverifiable).toBe(1); // market cap
+      expect(result.autoResolved).toBe(1); // freshness — existing behavior, unchanged
+
+      const resolved = await listIntegrityIssues(company.id, { status: 'RESOLVED' });
+      expect(resolved).toHaveLength(1);
+      expect(resolved[0]!.category).toBe('DATA_FRESHNESS');
+    });
+
+    it('never auto-closes a FINANCIAL_RECONCILIATION issue this way, even if its finding disappears entirely', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeFinding({ category: 'FINANCIAL_RECONCILIATION', dedupeKey: 'recon:disappearing' })]);
+
+      const result = await syncIssuesFromFindings(company.id, []); // the finding vanishes entirely
+      expect(result.autoClosedUnverifiable).toBe(0);
+
+      const issues = await listIntegrityIssues(company.id, { status: 'OPEN' });
+      expect(issues).toHaveLength(1); // still open — MARKET_DATA_INTEGRITY is the only auto-close-eligible category
     });
   });
 

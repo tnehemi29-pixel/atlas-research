@@ -39,6 +39,25 @@ export const AUTO_RESOLVABLE_CATEGORIES: ReadonlySet<IntegrityIssueCategory> = n
   'HISTORICAL_VALIDATION_LIMITATION',
 ]);
 
+/**
+ * Deliberately separate from AUTO_RESOLVABLE_CATEGORIES above, and
+ * deliberately narrow — currently only MARKET_DATA_INTEGRITY, the one
+ * category produced solely by checkMarketCapReconciliation's tolerance
+ * check. AUTO_RESOLVABLE_CATEGORIES means "the check ran, was checkable,
+ * and now passes" (a real verification). This set means something weaker
+ * and different: "the check that used to flag this can no longer run at
+ * all" (e.g. the market quote and the filing it would compare against are
+ * now too far apart to compare reliably) — never a confirmation that the
+ * original finding was correct, incorrect, or has been fixed. An issue in
+ * one of these categories is auto-CLOSED (status IGNORED, not RESOLVED, and
+ * with an honest reason saying exactly that) rather than left OPEN forever
+ * once its check stops being able to run — see the second loop in
+ * syncIssuesFromFindings. Every other category (FINANCIAL_RECONCILIATION,
+ * DCF_MODEL_ERROR, COMPS_MODEL_ERROR, research contradictions, thesis
+ * conflicts, etc.) is untouched by this and always requires a human.
+ */
+export const AUTO_CLOSE_WHEN_UNVERIFIABLE_CATEGORIES: ReadonlySet<IntegrityIssueCategory> = new Set<IntegrityIssueCategory>(['MARKET_DATA_INTEGRITY']);
+
 export interface FindingForIssueSync {
   category: IntegrityIssueCategory;
   severity: IntegrityIssueSeverity;
@@ -55,11 +74,43 @@ export interface FindingForIssueSync {
 export interface SyncIssuesResult {
   created: number;
   autoResolved: number;
+  /** Issues closed because their check stopped being able to run at all —
+   * see AUTO_CLOSE_WHEN_UNVERIFIABLE_CATEGORIES. Always status IGNORED, not
+   * RESOLVED — "no longer checkable" is never the same fact as "verified
+   * and passed." */
+  autoClosedUnverifiable: number;
 }
 
 export async function syncIssuesFromFindings(companyId: string, findings: FindingForIssueSync[]): Promise<SyncIssuesResult> {
   let created = 0;
   let autoResolved = 0;
+  let autoClosedUnverifiable = 0;
+
+  // A dedupeKey that was OPEN/ACKNOWLEDGED before but is entirely absent
+  // from `findings` this run means its check could no longer run at all —
+  // a different situation from "ran and now passes" (handled below in the
+  // main loop). Only for the narrow, explicitly-listed categories where
+  // that's known to be safe; every other category is left exactly as-is,
+  // still OPEN, still requiring a human — same as if this block didn't
+  // exist.
+  const currentDedupeKeys = new Set(findings.map((f) => f.dedupeKey));
+  const noLongerProducible = await db.researchIntegrityIssue.findMany({
+    where: { companyId, status: { in: ['OPEN', 'ACKNOWLEDGED'] }, category: { in: [...AUTO_CLOSE_WHEN_UNVERIFIABLE_CATEGORIES] } },
+  });
+  for (const issue of noLongerProducible) {
+    if (currentDedupeKeys.has(issue.dedupeKey)) continue; // still actively checked this run — the main loop below handles it
+    await db.researchIntegrityIssue.update({
+      where: { id: issue.id },
+      data: {
+        status: 'IGNORED',
+        ignoreReason:
+          'Automatically closed — the underlying check can no longer verify this (the data needed for comparison is now considered too stale or mismatched to compare reliably). This is not a confirmation that the original finding was correct, incorrect, or has been fixed; a human should still review if the same problem recurs.',
+        resolvedAt: new Date(),
+      },
+    });
+    autoClosedUnverifiable += 1;
+    await writeAuditLogEntry({ companyId, entityType: 'ResearchIntegrityIssue', entityId: issue.id, action: 'ISSUE_IGNORED', detail: { category: issue.category, dedupeKey: issue.dedupeKey, reason: 'auto-closed-unverifiable' } });
+  }
 
   for (const finding of findings) {
     const existing = await db.researchIntegrityIssue.findUnique({ where: { companyId_dedupeKey: { companyId, dedupeKey: finding.dedupeKey } } });
@@ -99,7 +150,7 @@ export async function syncIssuesFromFindings(companyId: string, findings: Findin
     }
   }
 
-  return { created, autoResolved };
+  return { created, autoResolved, autoClosedUnverifiable };
 }
 
 export interface ListIntegrityIssuesFilters {
