@@ -22,7 +22,11 @@ async function makeCompany(overrides: { price?: number | null; marketCap?: numbe
   });
 }
 
-async function makePeriod(companyId: string, fiscalYear: number, overrides: { revenue?: number | null; totalAssets?: number | null; cashAndEquivalents?: number | null } = {}) {
+async function makePeriod(
+  companyId: string,
+  fiscalYear: number,
+  overrides: { revenue?: number | null; totalAssets?: number | null; cashAndEquivalents?: number | null; filingDate?: Date } = {},
+) {
   const revenue = overrides.revenue ?? 500_000_000;
   return db.financialPeriod.create({
     data: {
@@ -31,7 +35,13 @@ async function makePeriod(companyId: string, fiscalYear: number, overrides: { re
       fiscalPeriod: 'FY',
       periodType: 'ANNUAL',
       periodEnd: new Date(`${fiscalYear}-12-31`),
-      filingDate: new Date(`${fiscalYear + 1}-02-01`),
+      // Default kept as a fixed calendar date (not "now"-relative) because
+      // the market-cap-reconciliation test below deliberately coordinates
+      // its own quoteUpdatedAt to sit close to this exact value — changing
+      // the default here would silently break that test's own freshness
+      // window instead. Tests that need a genuinely CURRENT filing (see
+      // 'runs freshness, completeness...' below) pass their own filingDate.
+      filingDate: overrides.filingDate ?? new Date(`${fiscalYear + 1}-02-01`),
       incomeStatement: {
         create: {
           revenue,
@@ -72,7 +82,13 @@ describe('dataQualityService', () => {
 
   it('runs freshness, completeness, and reconciliation checks and persists them', async () => {
     const company = await makeCompany();
-    await makePeriod(company.id, 2025);
+    // filingDate 60 days before "now": comfortably inside FINANCIAL_STATEMENTS'
+    // 100-day CURRENT window (a hardcoded calendar date drifts into AGING/STALE
+    // as real time passes — this doesn't), while still beyond
+    // MARKET_CAP_STALENESS_THRESHOLD_DAYS (45) from quoteUpdatedAt's default
+    // "now", so the market-cap-omission behavior documented just below is
+    // unaffected by this fix.
+    await makePeriod(company.id, 2025, { filingDate: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000) });
 
     const outcomes = await runDataQualityChecks(company.id);
     expect(outcomes.length).toBeGreaterThan(0);

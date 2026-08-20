@@ -177,7 +177,7 @@ export function runDcf(params: RunDcfParams): DcfResult {
   const upsideDownside = computeUpsideDownside(impliedSharePrice, marketData.currentSharePrice);
 
   // --- Validation --------------------------------------------------------
-  const inputIssues = validateDcfInputs(historicals, marketData, assumptions, waccValue);
+  const inputIssues = validateDcfInputs(historicals, marketData, assumptions, waccValue, wacc);
   const forecastIssues = validateForecast(forecast);
   const issues: ValidationIssue[] = [...inputIssues, ...forecastIssues];
   const isValid = issues.every((issue) => issue.severity !== 'ERROR');

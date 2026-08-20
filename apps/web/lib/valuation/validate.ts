@@ -1,4 +1,4 @@
-import type { DcfAssumptions, DcfMarketData, ForecastYear, HistoricalYear, ValidationIssue } from './types';
+import type { DcfAssumptions, DcfMarketData, ForecastYear, HistoricalYear, ValidationIssue, WaccResult } from './types';
 
 const MAX_SANE_PERPETUITY_GROWTH = 0.06; // above long-run GDP/inflation growth is a red flag, not a hard error
 
@@ -8,11 +8,33 @@ const MAX_SANE_PERPETUITY_GROWTH = 0.06; // above long-run GDP/inflation growth 
  * produce a trustworthy number and every downstream value field will be
  * null; WARNING issues are surfaced but don't block computation.
  */
+/** Picks the specific reason WACC is null when the caller has the full
+ * breakdown available, rather than the generic catch-all — e.g. "market cap
+ * is unavailable" vs. "total debt is unavailable" vs. "this company has debt
+ * but no verified cost of debt" are different, differently-actionable facts,
+ * and conflating them into one sentence makes the message useless for
+ * deciding what to do next. Never fabricates a cause: falls through to the
+ * generic message for any combination this doesn't specifically recognize,
+ * and never changes whether WACC is valid — only how the failure is worded. */
+function describeMissingWaccInputs(wacc: WaccResult): string {
+  if (wacc.marketCapitalization.value === null) {
+    return 'WACC could not be calculated — market capitalization is unavailable; provide a value to continue.';
+  }
+  if (wacc.totalDebt.value === null) {
+    return 'WACC could not be calculated — total debt is unavailable; provide a value (0 if the company is genuinely debt-free) to continue.';
+  }
+  if (wacc.debtWeight.value !== null && wacc.debtWeight.value > 0 && wacc.afterTaxCostOfDebt.value === null) {
+    return 'Historical cost of debt is unavailable for this company (interest expense is not broken out in its recent filings) — select a manual cost-of-debt assumption to calculate WACC.';
+  }
+  return 'WACC could not be calculated — check that market cap, total debt, and cost of equity/debt inputs are all provided.';
+}
+
 export function validateDcfInputs(
   historicals: HistoricalYear[],
   marketData: DcfMarketData,
   assumptions: DcfAssumptions,
   waccValue: number | null,
+  wacc?: WaccResult,
 ): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
 
@@ -64,7 +86,9 @@ export function validateDcfInputs(
     issues.push({
       severity: 'ERROR',
       field: 'wacc',
-      message: 'WACC could not be calculated — check that market cap, total debt, and cost of equity/debt inputs are all provided.',
+      message: wacc
+        ? describeMissingWaccInputs(wacc)
+        : 'WACC could not be calculated — check that market cap, total debt, and cost of equity/debt inputs are all provided.',
     });
   } else if (waccValue <= 0) {
     issues.push({ severity: 'ERROR', field: 'wacc', message: 'WACC must be positive.' });

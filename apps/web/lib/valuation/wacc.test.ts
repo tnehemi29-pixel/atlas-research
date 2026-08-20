@@ -176,3 +176,49 @@ describe('buildWaccResult — marketCapOverride ("allow the user to provide it" 
     expect(result.marketCapitalization.value).toBe(800);
   });
 });
+
+// The AAPL scenario: a company with real debt whose recent SEC filings don't
+// break out a standalone interest-expense figure (a real, general condition —
+// not specific to any one company).
+describe('WACC when historical cost of debt is unavailable', () => {
+  const assumptions: WaccAssumptions = {
+    riskFreeRate: 0.04,
+    equityRiskPremium: 0.055,
+    beta: 1.2,
+    betaSource: 'estimate',
+    costOfDebtMethod: 'historical',
+    costOfDebtUser: 0.05,
+  };
+  const marketDataWithDebtNoInterestExpense: DcfMarketData = {
+    currentSharePrice: 150,
+    marketCapitalization: 800,
+    totalDebt: 200, // has real debt
+    cash: 50,
+    dilutedSharesOutstanding: 10,
+    beta: 1.2,
+    interestExpense: null, // not broken out in recent filings — never inferred from a combined line
+  };
+
+  it('WACC cannot be resolved on the historical method — never fabricates a cost of debt from a combined income-statement line', () => {
+    const result = buildWaccResult(assumptions, marketDataWithDebtNoInterestExpense, 0.25);
+    expect(result.preTaxCostOfDebt.value).toBeNull();
+    expect(result.afterTaxCostOfDebt.value).toBeNull();
+    expect(result.debtWeight.value).toBeGreaterThan(0); // has debt — this must not be confused with the debt-free case
+    expect(result.wacc.value).toBeNull(); // still correctly blocked, not silently computed
+  });
+
+  it('switching to the user method with a manually-supplied cost of debt unblocks WACC — this is the existing, intended fallback, exercised explicitly rather than silently', () => {
+    const result = buildWaccResult({ ...assumptions, costOfDebtMethod: 'user', costOfDebtUser: 0.045 }, marketDataWithDebtNoInterestExpense, 0.25);
+    expect(result.preTaxCostOfDebt.value).toBe(0.045);
+    expect(result.preTaxCostOfDebt.source).toBe('user');
+    expect(result.wacc.value).not.toBeNull();
+  });
+
+  it('a genuinely debt-free company never needs a cost of debt at all — existing behavior, unaffected by this change', () => {
+    const debtFree: DcfMarketData = { ...marketDataWithDebtNoInterestExpense, totalDebt: 0 };
+    const result = buildWaccResult(assumptions, debtFree, 0.25);
+    expect(result.debtWeight.value).toBe(0);
+    expect(result.preTaxCostOfDebt.value).toBeNull(); // still not fabricated
+    expect(result.wacc.value).not.toBeNull(); // but doesn't block WACC, since the debt term contributes nothing
+  });
+});
