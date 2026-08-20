@@ -85,8 +85,60 @@ describe('checkDcfOwnValidation', () => {
     expect(findings[0]!.severity).toBe('CRITICAL');
   });
 
-  it('returns no findings when there are no ERROR-severity issues', () => {
-    expect(checkDcfOwnValidation(makeResult({ issues: [{ severity: 'WARNING', field: 'x', message: 'y' }] }))).toHaveLength(0);
+  it('the wacc field: passed:false, exact check string, and the original message preserved — when WACC is invalid', () => {
+    const result = makeResult({
+      isValid: false,
+      wacc: { ...makeResult().wacc, wacc: tag(null, 'calculated') },
+      issues: [{ severity: 'ERROR', field: 'wacc', message: 'Historical cost of debt is unavailable for this company (interest expense is not broken out in its recent filings) — select a manual cost-of-debt assumption to calculate WACC.' }],
+    });
+    const findings = checkDcfOwnValidation(result);
+    const waccFinding = findings.find((f) => f.check === 'DCF validation: wacc');
+    expect(waccFinding).toBeDefined();
+    expect(waccFinding!.passed).toBe(false);
+    expect(waccFinding!.message).toBe('Historical cost of debt is unavailable for this company (interest expense is not broken out in its recent filings) — select a manual cost-of-debt assumption to calculate WACC.');
+  });
+
+  it('the wacc field: passed:true with the exact check string — when WACC is valid and there is no wacc ERROR issue', () => {
+    // makeResult()'s default wacc.wacc is tag(0.09, 'calculated') (non-null) and issues defaults to [] —
+    // no ERROR issue for wacc, so this is the "WACC just became calculable" case this fix exists for.
+    const findings = checkDcfOwnValidation(makeResult());
+    const waccFinding = findings.find((f) => f.check === 'DCF validation: wacc');
+    expect(waccFinding).toBeDefined();
+    expect(waccFinding!.passed).toBe(true);
+    expect(waccFinding!.severity).toBe('INFO');
+    expect(waccFinding!.message).toMatch(/WACC is calculable/);
+    expect(waccFinding!.message).toMatch(/9\.00%/);
+    // Explicitly does not overclaim: confirms WACC resolves, not that every assumption is independently verified.
+    expect(waccFinding!.message).toMatch(/not an independent verification/);
+  });
+
+  it('never emits both a passing and a failing wacc finding at once', () => {
+    const result = makeResult({ isValid: false, issues: [{ severity: 'ERROR', field: 'wacc', message: 'WACC must be positive.' }] });
+    const findings = checkDcfOwnValidation(result).filter((f) => f.check === 'DCF validation: wacc');
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.passed).toBe(false);
+  });
+
+  it('does not fabricate a passing wacc finding when result.wacc.wacc.value is null but no ERROR issue was raised for it (defensive — should not occur in practice)', () => {
+    const result = makeResult({ wacc: { ...makeResult().wacc, wacc: tag(null, 'calculated') }, issues: [] });
+    const findings = checkDcfOwnValidation(result);
+    expect(findings.find((f) => f.check === 'DCF validation: wacc')).toBeUndefined();
+  });
+
+  it('does not add a passing/failing finding for any other field — unrelated fields are unaffected', () => {
+    const result = makeResult({ isValid: false, issues: [{ severity: 'ERROR', field: 'totalDebt', message: 'Total debt is unavailable.' }] });
+    const findings = checkDcfOwnValidation(result);
+    // The failing totalDebt finding, plus the new passing wacc finding (WACC itself is still valid here) — nothing else.
+    expect(findings).toHaveLength(2);
+    expect(findings.find((f) => f.check === 'DCF validation: totalDebt')?.passed).toBe(false);
+    expect(findings.find((f) => f.check === 'DCF validation: wacc')?.passed).toBe(true);
+  });
+
+  it('returns only the passing wacc finding when there are no ERROR-severity issues and WACC is valid', () => {
+    const findings = checkDcfOwnValidation(makeResult({ issues: [{ severity: 'WARNING', field: 'x', message: 'y' }] }));
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.check).toBe('DCF validation: wacc');
+    expect(findings[0]!.passed).toBe(true);
   });
 });
 

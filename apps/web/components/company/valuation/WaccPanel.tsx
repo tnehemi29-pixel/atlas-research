@@ -1,7 +1,9 @@
 'use client';
 
+import { useState } from 'react';
 import type { DcfAssumptions, DcfMarketData, RateMethod, WaccResult } from '@/lib/valuation/types';
 import { formatCompactCurrency, formatRatioAsPercent } from '@/lib/utils/format';
+import { ApiError } from '@/lib/api/companies';
 import { NumberField, PercentField, SelectField } from './fields';
 import { ProvenanceBadge } from './ProvenanceBadge';
 
@@ -19,6 +21,13 @@ interface WaccPanelProps {
    * is null) and to seed a sensible starting label, independent of whatever
    * value `wacc.marketCapitalization` currently resolves to. */
   marketData: DcfMarketData;
+  /** The cost-of-debt value currently saved for this company (null if none
+   * has ever been explicitly saved) — distinct from `assumptions.wacc.
+   * costOfDebtUser`, which is just whatever is currently typed/being
+   * explored and may not match what's saved. */
+  savedCostOfDebtOverride: number | null;
+  onSaveCostOfDebtOverride: (value: number) => Promise<void>;
+  onClearCostOfDebtOverride: () => Promise<void>;
 }
 
 function OutputRow({
@@ -43,11 +52,52 @@ function OutputRow({
   );
 }
 
-export function WaccPanel({ assumptions, onChange, wacc, marketData }: WaccPanelProps) {
+const MIN_COST_OF_DEBT = 0;
+const MAX_COST_OF_DEBT = 1;
+
+export function WaccPanel({
+  assumptions,
+  onChange,
+  wacc,
+  marketData,
+  savedCostOfDebtOverride,
+  onSaveCostOfDebtOverride,
+  onClearCostOfDebtOverride,
+}: WaccPanelProps) {
   const w = assumptions.wacc;
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'clearing' | 'error'>('idle');
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   function update(patch: Partial<DcfAssumptions['wacc']>) {
     onChange({ ...assumptions, wacc: { ...w, ...patch } });
+  }
+
+  const isValidCostOfDebt =
+    Number.isFinite(w.costOfDebtUser) && w.costOfDebtUser >= MIN_COST_OF_DEBT && w.costOfDebtUser <= MAX_COST_OF_DEBT;
+  const matchesSaved = savedCostOfDebtOverride !== null && savedCostOfDebtOverride === w.costOfDebtUser;
+
+  async function handleSave() {
+    setSaveStatus('saving');
+    setSaveError(null);
+    try {
+      await onSaveCostOfDebtOverride(w.costOfDebtUser);
+      setSaveStatus('idle');
+    } catch (error) {
+      setSaveStatus('error');
+      setSaveError(error instanceof ApiError ? error.message : 'Failed to save the cost-of-debt assumption.');
+    }
+  }
+
+  async function handleClear() {
+    setSaveStatus('clearing');
+    setSaveError(null);
+    try {
+      await onClearCostOfDebtOverride();
+      setSaveStatus('idle');
+    } catch (error) {
+      setSaveStatus('error');
+      setSaveError(error instanceof ApiError ? error.message : 'Failed to clear the saved cost-of-debt assumption.');
+    }
   }
 
   return (
@@ -97,6 +147,65 @@ export function WaccPanel({ assumptions, onChange, wacc, marketData }: WaccPanel
               />
             )}
           </div>
+
+          {w.costOfDebtMethod === 'user' && (
+            <div className="border-ink/10 mt-3 border-t pt-3">
+              {matchesSaved ? (
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-ink/60 text-xs">
+                    Saved for this company at {formatRatioAsPercent(savedCostOfDebtOverride)} — every analyst viewing this
+                    page, and Research Integrity&apos;s automated DCF audit, will use this value until it&apos;s changed or
+                    cleared.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={handleClear}
+                    disabled={saveStatus === 'clearing'}
+                    className="text-ink/40 shrink-0 text-xs hover:text-red-700 disabled:opacity-50"
+                  >
+                    {saveStatus === 'clearing' ? 'Clearing…' : 'Clear saved assumption'}
+                  </button>
+                </div>
+              ) : (
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-ink/60 text-xs">
+                    {savedCostOfDebtOverride !== null
+                      ? `Currently saved for this company: ${formatRatioAsPercent(savedCostOfDebtOverride)}. The value above is only being explored — it hasn't been saved.`
+                      : "Not saved yet — the value above is only being explored here and won't affect Research Integrity's audit until you save it."}
+                  </p>
+                  <div className="flex shrink-0 items-center gap-3">
+                    {savedCostOfDebtOverride !== null && (
+                      <button
+                        type="button"
+                        onClick={handleClear}
+                        disabled={saveStatus === 'clearing' || saveStatus === 'saving'}
+                        className="text-ink/40 text-xs hover:text-red-700 disabled:opacity-50"
+                      >
+                        Clear saved
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={handleSave}
+                      disabled={!isValidCostOfDebt || saveStatus === 'saving' || saveStatus === 'clearing'}
+                      className="bg-accent rounded-lg px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
+                    >
+                      {saveStatus === 'saving'
+                        ? 'Saving…'
+                        : savedCostOfDebtOverride !== null
+                          ? 'Update saved assumption'
+                          : 'Save assumption for this company'}
+                    </button>
+                  </div>
+                </div>
+              )}
+              {!isValidCostOfDebt && (
+                <p className="mt-2 text-xs text-red-700">Enter a rate between 0% and 100% before saving.</p>
+              )}
+              {saveStatus === 'error' && saveError && <p className="mt-2 text-xs text-red-700">{saveError}</p>}
+            </div>
+          )}
+
           <p className="text-ink/40 mt-3 text-xs">
             Beta {assumptions.wacc.betaSource === 'estimate' ? 'was retrieved from Financial Modeling Prep' : 'is a user assumption'}
             {' — '}editing it always switches to a user assumption.

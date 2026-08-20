@@ -147,4 +147,37 @@ describe('runPointInTimeDcf', () => {
     vi.mocked(getFinancials).mockRejectedValue(new CompanyNotFoundError('no filer'));
     expect(await runPointInTimeDcf('NOPE', '2022-06-01')).toBeNull();
   });
+
+  // Company.costOfDebtOverride (an explicitly saved manual WACC assumption,
+  // see prisma/schema.prisma) is never consulted here — runPointInTimeDcf's
+  // signature is just (ticker, asOfDate), and buildPointInTimeMarketData only
+  // reads the point-in-time period's own interestExpense, never a Company
+  // row. This test proves the point-in-time WACC calculation stays exactly
+  // as blocked as it would be for any company with no saved override, when
+  // the historical period itself has no interest expense to calculate from
+  // — a company-level override existing in the database (regardless of its
+  // value) could never change this result.
+  it('does not use a company-level cost-of-debt override — stays blocked on missing period-level interest expense alone', async () => {
+    const periodWithoutInterestExpense: FinancialPeriodData = {
+      ...makePeriod(2021, '2022-02-01'),
+      incomeStatement: { ...makePeriod(2021, '2022-02-01').incomeStatement, interestExpense: null },
+    };
+    vi.mocked(getFinancials).mockResolvedValue({
+      ticker: 'ACME',
+      periodType: 'annual',
+      periods: [periodWithoutInterestExpense],
+      stale: false,
+      dataAsOf: '2026-01-01',
+    });
+    vi.mocked(getPriceAsOf).mockResolvedValue({ date: '2022-06-01', close: 50 });
+    vi.mocked(getCompanyOverview).mockResolvedValue({
+      ticker: 'ACME', name: 'Acme', exchange: null, sector: null, industry: null, country: null, logoUrl: null,
+      price: 999, changePercent: null, marketCap: 999_000_000_000, yearHigh: null, yearLow: null, beta: 1.2, quoteUpdatedAt: null, stale: false,
+    });
+
+    const result = await runPointInTimeDcf('ACME', '2022-06-01');
+    expect(result).not.toBeNull();
+    expect(result?.isValid).toBe(false);
+    expect(result?.forecast).toEqual([]);
+  });
 });

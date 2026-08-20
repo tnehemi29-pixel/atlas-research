@@ -11,6 +11,7 @@ import { buildSensitivityGrid } from '@/lib/valuation/sensitivity';
 import { DEFAULT_BEAR_DELTAS, DEFAULT_BULL_DELTAS, type ScenarioDeltas } from '@/lib/valuation/scenarios';
 import type { DcfAssumptions } from '@/lib/valuation/types';
 import { formatMultiple, formatRatioAsPercent } from '@/lib/utils/format';
+import { clearCostOfDebtOverride, saveCostOfDebtOverride } from '@/lib/api/valuationOverride';
 import { ValuationHeader } from './ValuationHeader';
 import { ValidationIssues } from './ValidationIssues';
 import { HistoricalPerformanceTable } from './HistoricalPerformanceTable';
@@ -26,16 +27,40 @@ interface DcfWorkspaceProps {
   ticker: string;
   overview: CompanyOverview;
   financials: CompanyFinancialsResponse;
+  /** The company's saved manual cost-of-debt assumption, if any analyst has
+   * ever explicitly saved one (null otherwise) — see
+   * Company.costOfDebtOverride's schema comment. Only ever seeds the
+   * initial WACC assumptions here; never affects buildDefaultAssumptions()
+   * itself or any other DCF caller. */
+  savedCostOfDebtOverride: number | null;
 }
 
-export function DcfWorkspace({ ticker, overview, financials }: DcfWorkspaceProps) {
+export function DcfWorkspace({ ticker, overview, financials, savedCostOfDebtOverride }: DcfWorkspaceProps) {
   const historicals = useMemo(() => deriveHistoricalYears(financials.periods), [financials]);
   const marketData = useMemo(() => buildMarketData(overview, financials.periods), [overview, financials]);
   const averages = useMemo(() => computeHistoricalAverages(historicals), [historicals]);
 
-  const [assumptions, setAssumptions] = useState<DcfAssumptions>(() => buildDefaultAssumptions(marketData));
+  const [assumptions, setAssumptions] = useState<DcfAssumptions>(() => {
+    const defaults = buildDefaultAssumptions(marketData);
+    if (savedCostOfDebtOverride === null) return defaults;
+    return {
+      ...defaults,
+      wacc: { ...defaults.wacc, costOfDebtMethod: 'user', costOfDebtUser: savedCostOfDebtOverride },
+    };
+  });
   const [bearDeltas, setBearDeltas] = useState<ScenarioDeltas>(DEFAULT_BEAR_DELTAS);
   const [bullDeltas, setBullDeltas] = useState<ScenarioDeltas>(DEFAULT_BULL_DELTAS);
+  const [savedOverride, setSavedOverride] = useState<number | null>(savedCostOfDebtOverride);
+
+  async function handleSaveCostOfDebtOverride(value: number) {
+    const saved = await saveCostOfDebtOverride(ticker, value);
+    setSavedOverride(saved);
+  }
+
+  async function handleClearCostOfDebtOverride() {
+    await clearCostOfDebtOverride(ticker);
+    setSavedOverride(null);
+  }
 
   const result = useMemo(
     () => runDcf({ historicals, marketData, assumptions }),
@@ -92,7 +117,15 @@ export function DcfWorkspace({ ticker, overview, financials }: DcfWorkspaceProps
 
       <ForecastAssumptionsPanel assumptions={assumptions} onChange={setAssumptions} averages={averages} />
 
-      <WaccPanel assumptions={assumptions} onChange={setAssumptions} wacc={result.wacc} marketData={marketData} />
+      <WaccPanel
+        assumptions={assumptions}
+        onChange={setAssumptions}
+        wacc={result.wacc}
+        marketData={marketData}
+        savedCostOfDebtOverride={savedOverride}
+        onSaveCostOfDebtOverride={handleSaveCostOfDebtOverride}
+        onClearCostOfDebtOverride={handleClearCostOfDebtOverride}
+      />
 
       <DcfOutputTable assumptions={assumptions} onChange={setAssumptions} result={result} marketData={marketData} />
 

@@ -35,6 +35,19 @@ model Company {
   beta           Float?
   quoteUpdatedAt DateTime?
 
+  // An explicitly saved manual pre-tax cost-of-debt assumption (a decimal
+  // ratio, e.g. 0.065 = 6.5%) — set only via a deliberate user Save action on
+  // the Valuation page, never inferred or defaulted. Null means no override
+  // has ever been saved. Shared/global like the quote snapshot above, not
+  // per-user: this is a company-scoped analyst judgment call, not private
+  // data. lib/valuation/engine.ts's buildDefaultAssumptions() and every
+  // stateless DCF caller (quickValuation, pointInTimeValuation,
+  // aggregateResearchContext) never read this field — only
+  // components/company/valuation/DcfWorkspace.tsx's initial state and
+  // lib/services/modelAuditService.ts's runDcfModelAudit() consult it,
+  // and both always set costOfDebtMethod: 'user' explicitly when they do.
+  costOfDebtOverride Float?
+
   // SEC EDGAR identity + financial-data ingest bookkeeping (Milestone 3).
   cik                String?   @unique
   financialsSyncedAt DateTime?

@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import { notFound } from 'next/navigation';
 import { getCompanyOverview } from '@/lib/services/companyService';
 import { getFinancials } from '@/lib/services/financialDataService';
+import { getCostOfDebtOverride } from '@/lib/services/valuationOverrideService';
 import { CompanyNav } from '@/components/company/CompanyNav';
 import { DcfWorkspace } from '@/components/company/valuation/DcfWorkspace';
 
@@ -65,5 +66,14 @@ export default async function ValuationPage({ params }: ValuationPageProps) {
     );
   }
 
-  return <DcfWorkspace ticker={ticker} overview={overview} financials={financials} />;
+  const savedCostOfDebtOverride = await getCostOfDebtOverride(ticker).catch(() => null);
+
+  return (
+    <DcfWorkspace
+      ticker={ticker}
+      overview={overview}
+      financials={financials}
+      savedCostOfDebtOverride={savedCostOfDebtOverride}
+    />
+  );
 }

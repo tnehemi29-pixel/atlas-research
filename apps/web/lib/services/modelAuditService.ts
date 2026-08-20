@@ -5,6 +5,7 @@ import { getFinancials } from '@/lib/services/financialDataService';
 import { deriveHistoricalYears } from '@/lib/valuation/historicals';
 import { buildMarketData } from '@/lib/valuation/marketData';
 import { buildDefaultAssumptions, runDcf } from '@/lib/valuation/engine';
+import type { DcfAssumptions } from '@/lib/valuation/types';
 import { getPeerCandidates, fetchTargetAndPeers } from '@/lib/services/compsDataService';
 import { runComps } from '@/lib/comps/engine';
 import type { PeerSelection } from '@/lib/comps/types';
@@ -63,7 +64,16 @@ export async function runDcfModelAudit(companyId: string): Promise<ModelAuditOut
 
   const historicals = deriveHistoricalYears(periods);
   const marketData = buildMarketData(overview, periods);
-  const assumptions = buildDefaultAssumptions(marketData);
+  const defaultAssumptions = buildDefaultAssumptions(marketData);
+  // A saved, explicit user assumption (never a default Atlas invents) — see
+  // Company.costOfDebtOverride's schema comment. Patched in locally, on top
+  // of the unmodified default assumptions, so this audit reflects the same
+  // saved choice the Valuation page shows instead of independently
+  // reconstructing a blocked default when one has been recorded.
+  const assumptions: DcfAssumptions =
+    company.costOfDebtOverride !== null
+      ? { ...defaultAssumptions, wacc: { ...defaultAssumptions.wacc, costOfDebtMethod: 'user', costOfDebtUser: company.costOfDebtOverride } }
+      : defaultAssumptions;
   const result = runDcf({ historicals, marketData, assumptions });
 
   const findings = auditDcf(assumptions, result, marketData);

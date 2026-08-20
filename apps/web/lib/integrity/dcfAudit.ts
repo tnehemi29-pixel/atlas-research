@@ -73,9 +73,20 @@ export function checkTerminalGrowthBelowWacc(assumptions: DcfAssumptions, result
  * `issues`/`isValid`) as integrity findings — never a duplicate, second
  * validation pass, just a re-statement in this milestone's own finding
  * shape so the company integrity panel doesn't need to know two different
- * "is this DCF okay" vocabularies. */
+ * "is this DCF okay" vocabularies.
+ *
+ * Every field here only ever surfaces a finding while it's currently
+ * failing — silence on success, same as this function has always behaved —
+ * with one deliberate exception: `wacc`. A saved company-level cost-of-debt
+ * override (Company.costOfDebtOverride) can turn a previously-blocking WACC
+ * error into a valid, calculable WACC, and lib/services/integrityIssueService.ts's
+ * syncIssuesFromFindings needs an explicit `passed: true` finding to ever
+ * observe that transition and resolve the previously-tracked issue — a
+ * check that's silently absent when it passes can never be observed to have
+ * started passing. See AUTO_RESOLVABLE_FINDING_KEYS there. Every other
+ * field's silence-on-success behavior is unchanged. */
 export function checkDcfOwnValidation(result: DcfResult): IntegrityFinding[] {
-  return result.issues
+  const findings: IntegrityFinding[] = result.issues
     .filter((issue) => issue.severity === 'ERROR')
     .map((issue) => ({
       check: `DCF validation: ${issue.field}`,
@@ -83,6 +94,24 @@ export function checkDcfOwnValidation(result: DcfResult): IntegrityFinding[] {
       passed: false,
       message: issue.message,
     }));
+
+  const hasFailingWaccFinding = findings.some((finding) => finding.check === 'DCF validation: wacc');
+  // result.wacc.wacc.value !== null is a defensive re-check, not an
+  // independent source of truth: the absence of a wacc ERROR issue above
+  // already means whatever WACC value was validated was non-null and
+  // positive. If that were ever untrue anyway, this simply emits nothing
+  // (matching the prior/default behavior) rather than fabricate a "passed"
+  // claim about a value that isn't actually there.
+  if (!hasFailingWaccFinding && result.wacc.wacc.value !== null) {
+    findings.push({
+      check: 'DCF validation: wacc',
+      severity: 'INFO',
+      passed: true,
+      message: `WACC is calculable (${(result.wacc.wacc.value * 100).toFixed(2)}%) from the currently provided inputs. This confirms the discount rate itself resolves — it is not an independent verification of every underlying assumption.`,
+    });
+  }
+
+  return findings;
 }
 
 export function auditDcf(assumptions: DcfAssumptions, result: DcfResult, marketData: DcfMarketData): IntegrityFinding[] {

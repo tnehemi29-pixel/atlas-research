@@ -121,6 +121,78 @@ describe('modelAuditService', () => {
       const outcome = await runDcfModelAudit('nonexistent-id');
       expect(outcome).toBeNull();
     });
+
+    function makePeriodNoInterestExpense(fiscalYear: number, revenue: number, filingDate: string): FinancialPeriodData {
+      const period = makePeriod(fiscalYear, revenue, filingDate);
+      return { ...period, incomeStatement: { ...period.incomeStatement, interestExpense: null } };
+    }
+
+    function mockNoInterestExpenseData() {
+      vi.mocked(getCompanyOverview).mockResolvedValue({
+        ticker: TICKER, name: 'Cost Of Debt Test Co.', exchange: 'NASDAQ', sector: 'Tech', industry: 'Software', country: 'US', logoUrl: null,
+        price: 50, changePercent: 0, marketCap: 5_000_000_000, yearHigh: 60, yearLow: 40, beta: 1.1, quoteUpdatedAt: new Date().toISOString(), stale: false,
+      });
+      vi.mocked(getFinancials).mockResolvedValue({
+        ticker: TICKER, periodType: 'annual', stale: false,
+        periods: [
+          makePeriodNoInterestExpense(2023, 1_800_000_000, '2024-02-01'),
+          makePeriodNoInterestExpense(2024, 2_000_000_000, '2025-02-01'),
+          makePeriodNoInterestExpense(2025, 2_200_000_000, '2026-02-01'),
+        ],
+      } as never);
+    }
+
+    it('remains blocked (a failing DCF validation: wacc finding) when no override is saved and historical interest expense is unavailable', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Cost Of Debt Test Co.' } });
+      mockNoInterestExpenseData();
+
+      const outcome = await runDcfModelAudit(company.id);
+      expect(outcome).not.toBeNull();
+      const waccFinding = outcome!.findings.find((f) => f.check === 'DCF validation: wacc');
+      expect(waccFinding?.passed).toBe(false);
+      expect(outcome!.passed).toBe(false);
+    });
+
+    it('uses a saved company-level cost-of-debt override so WACC calculates and the DCF validation: wacc finding no longer fails', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Cost Of Debt Test Co.', costOfDebtOverride: 0.065 } });
+      mockNoInterestExpenseData();
+
+      const outcome = await runDcfModelAudit(company.id);
+      expect(outcome).not.toBeNull();
+      // lib/integrity/dcfAudit.ts's checkDcfOwnValidation now emits an
+      // explicit passed:true finding for wacc once it's calculable (rather
+      // than omitting it) — the signal integrityIssueService.ts's
+      // AUTO_RESOLVABLE_FINDING_KEYS needs to ever resolve a previously
+      // OPEN "dcf:DCF validation: wacc" issue.
+      const waccFinding = outcome!.findings.find((f) => f.check === 'DCF validation: wacc');
+      expect(waccFinding?.passed).toBe(true);
+
+      const persisted = await getLatestModelAudit(company.id, 'DCF_MODEL');
+      const snapshot = persisted!.inputsSnapshot as { assumptions: { wacc: { costOfDebtMethod: string; costOfDebtUser: number } } };
+      expect(snapshot.assumptions.wacc.costOfDebtMethod).toBe('user');
+      expect(snapshot.assumptions.wacc.costOfDebtUser).toBe(0.065);
+    });
+
+    it('does not modify the historical cost-of-debt path for a company with no saved override and real interest expense data', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Model Audit Test Co.' } });
+      vi.mocked(getCompanyOverview).mockResolvedValue({
+        ticker: TICKER, name: 'Model Audit Test Co.', exchange: 'NASDAQ', sector: 'Tech', industry: 'Software', country: 'US', logoUrl: null,
+        price: 50, changePercent: 0, marketCap: 5_000_000_000, yearHigh: 60, yearLow: 40, beta: 1.1, quoteUpdatedAt: new Date().toISOString(), stale: false,
+      });
+      vi.mocked(getFinancials).mockResolvedValue({
+        ticker: TICKER, periodType: 'annual', stale: false,
+        periods: [makePeriod(2023, 1_800_000_000, '2024-02-01'), makePeriod(2024, 2_000_000_000, '2025-02-01'), makePeriod(2025, 2_200_000_000, '2026-02-01')],
+      } as never);
+
+      const outcome = await runDcfModelAudit(company.id);
+      const persisted = await getLatestModelAudit(company.id, 'DCF_MODEL');
+      const snapshot = persisted!.inputsSnapshot as { assumptions: { wacc: { costOfDebtMethod: string } } };
+      expect(snapshot.assumptions.wacc.costOfDebtMethod).toBe('historical');
+      // Real historical interest expense resolves WACC without any override
+      // — checkDcfOwnValidation reports that as passed:true, same as the
+      // override case above; the override mechanism itself is unaffected.
+      expect(outcome!.findings.find((f) => f.check === 'DCF validation: wacc')?.passed).toBe(true);
+    });
   });
 
   describe('runCompsModelAudit', () => {
