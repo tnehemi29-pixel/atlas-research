@@ -55,6 +55,39 @@ function OutputRow({
 const MIN_COST_OF_DEBT = 0;
 const MAX_COST_OF_DEBT = 1;
 
+/**
+ * Which saved-cost-of-debt status/management UI (if any) the panel should
+ * show, and how — kept as a pure function of just the three inputs it
+ * actually depends on so it's testable without rendering anything (no
+ * React Testing Library exists anywhere in this codebase; every other test
+ * here is a plain function/service test, and this follows that same
+ * convention rather than introducing a new one for a single component).
+ *
+ * The saved override is a company-level DB value, entirely independent of
+ * which method is currently selected locally — switching the "Cost of Debt
+ * Method" dropdown is pure local exploration and never deletes or modifies
+ * it, so a saved value must stay visible (and clearable) even while the
+ * user is looking at the calculated/historical method.
+ */
+export type CostOfDebtStatusView =
+  | { visible: false }
+  | { visible: true; mode: 'saved-other-method' }
+  | { visible: true; mode: 'saved-matches' }
+  | { visible: true; mode: 'saved-diverged' }
+  | { visible: true; mode: 'unsaved' };
+
+export function resolveCostOfDebtStatusView(
+  costOfDebtMethod: RateMethod,
+  costOfDebtUser: number,
+  savedCostOfDebtOverride: number | null,
+): CostOfDebtStatusView {
+  if (costOfDebtMethod !== 'user') {
+    return savedCostOfDebtOverride !== null ? { visible: true, mode: 'saved-other-method' } : { visible: false };
+  }
+  if (savedCostOfDebtOverride === null) return { visible: true, mode: 'unsaved' };
+  return savedCostOfDebtOverride === costOfDebtUser ? { visible: true, mode: 'saved-matches' } : { visible: true, mode: 'saved-diverged' };
+}
+
 export function WaccPanel({
   assumptions,
   onChange,
@@ -74,7 +107,7 @@ export function WaccPanel({
 
   const isValidCostOfDebt =
     Number.isFinite(w.costOfDebtUser) && w.costOfDebtUser >= MIN_COST_OF_DEBT && w.costOfDebtUser <= MAX_COST_OF_DEBT;
-  const matchesSaved = savedCostOfDebtOverride !== null && savedCostOfDebtOverride === w.costOfDebtUser;
+  const statusView = resolveCostOfDebtStatusView(w.costOfDebtMethod, w.costOfDebtUser, savedCostOfDebtOverride);
 
   async function handleSave() {
     setSaveStatus('saving');
@@ -148,9 +181,33 @@ export function WaccPanel({
             )}
           </div>
 
-          {w.costOfDebtMethod === 'user' && (
+          {statusView.visible && (
             <div className="border-ink/10 mt-3 border-t pt-3">
-              {matchesSaved ? (
+              {statusView.mode === 'saved-other-method' ? (
+                // A saved override exists for this company, but the user is
+                // currently exploring the calculated/historical method
+                // locally — switching methods never deletes or modifies the
+                // persisted override (only "Clear saved assumption" does),
+                // so the saved value stays visible and manageable here even
+                // though it isn't the method currently driving the DCF
+                // output below.
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-ink/60 text-xs">
+                    Saved for this company at {formatRatioAsPercent(savedCostOfDebtOverride)} — used whenever
+                    User-Defined is selected, and by Research Integrity&apos;s automated DCF audit, until it&apos;s
+                    changed or cleared. You&apos;re currently viewing the calculated (historical) method locally; this
+                    doesn&apos;t affect the saved value.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={handleClear}
+                    disabled={saveStatus === 'clearing'}
+                    className="text-ink/40 shrink-0 text-xs hover:text-red-700 disabled:opacity-50"
+                  >
+                    {saveStatus === 'clearing' ? 'Clearing…' : 'Clear saved assumption'}
+                  </button>
+                </div>
+              ) : statusView.mode === 'saved-matches' ? (
                 <div className="flex items-center justify-between gap-3">
                   <p className="text-ink/60 text-xs">
                     Saved for this company at {formatRatioAsPercent(savedCostOfDebtOverride)} — every analyst viewing this
@@ -169,12 +226,12 @@ export function WaccPanel({
               ) : (
                 <div className="flex items-center justify-between gap-3">
                   <p className="text-ink/60 text-xs">
-                    {savedCostOfDebtOverride !== null
+                    {statusView.mode === 'saved-diverged'
                       ? `Currently saved for this company: ${formatRatioAsPercent(savedCostOfDebtOverride)}. The value above is only being explored — it hasn't been saved.`
                       : "Not saved yet — the value above is only being explored here and won't affect Research Integrity's audit until you save it."}
                   </p>
                   <div className="flex shrink-0 items-center gap-3">
-                    {savedCostOfDebtOverride !== null && (
+                    {statusView.mode === 'saved-diverged' && (
                       <button
                         type="button"
                         onClick={handleClear}
@@ -192,14 +249,14 @@ export function WaccPanel({
                     >
                       {saveStatus === 'saving'
                         ? 'Saving…'
-                        : savedCostOfDebtOverride !== null
+                        : statusView.mode === 'saved-diverged'
                           ? 'Update saved assumption'
                           : 'Save assumption for this company'}
                     </button>
                   </div>
                 </div>
               )}
-              {!isValidCostOfDebt && (
+              {w.costOfDebtMethod === 'user' && !isValidCostOfDebt && (
                 <p className="mt-2 text-xs text-red-700">Enter a rate between 0% and 100% before saving.</p>
               )}
               {saveStatus === 'error' && saveError && <p className="mt-2 text-xs text-red-700">{saveError}</p>}
