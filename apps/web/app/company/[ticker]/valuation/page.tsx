@@ -66,7 +66,26 @@ export default async function ValuationPage({ params }: ValuationPageProps) {
     );
   }
 
-  const savedCostOfDebtOverride = await getCostOfDebtOverride(ticker).catch(() => null);
+  let savedCostOfDebtOverride: number | null;
+  try {
+    savedCostOfDebtOverride = await getCostOfDebtOverride(ticker);
+  } catch {
+    // A failed lookup is NOT the same thing as "no override saved" — treating
+    // it that way silently seeds the WACC calculation as if the saved
+    // assumption never existed, producing a false "WACC could not be
+    // calculated" block even though Research Integrity's own (separate)
+    // query for the same value succeeds. Fail the same visible way the
+    // overview/financials fetches above do, instead of rendering a
+    // confidently wrong page.
+    return (
+      <main className="mx-auto flex min-h-[60vh] max-w-lg flex-col items-center justify-center px-6 text-center">
+        <h1 className="text-ink font-serif text-2xl">Data temporarily unavailable</h1>
+        <p className="text-ink/60 mt-2">
+          We couldn&apos;t reach the data provider for {ticker}. Please try again shortly.
+        </p>
+      </main>
+    );
+  }
 
   return (
     <DcfWorkspace

@@ -33,9 +33,28 @@ function validateCostOfDebtOverride(value: unknown): number {
   return value;
 }
 
+/**
+ * Neon's pooled connection endpoint (see lib/db.ts's dbDirect comment)
+ * occasionally rejects a query with a transient connection error under cold
+ * starts or pool contention. This read sits on the hot path of every
+ * valuation page load, and its caller must be able to tell "this company has
+ * no saved override" apart from "we failed to find out" — one retry absorbs
+ * the transient case so a genuine, persistent failure is the only thing left
+ * for the caller to handle.
+ */
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch {
+    return fn();
+  }
+}
+
 export async function getCostOfDebtOverride(rawTicker: string): Promise<number | null> {
   const ticker = rawTicker.trim().toUpperCase();
-  const company = await db.company.findUnique({ where: { ticker }, select: { costOfDebtOverride: true } });
+  const company = await withRetry(() =>
+    db.company.findUnique({ where: { ticker }, select: { costOfDebtOverride: true } }),
+  );
   return company?.costOfDebtOverride ?? null;
 }
 
