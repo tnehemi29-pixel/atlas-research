@@ -148,7 +148,7 @@ describe('validateDcfInputs', () => {
       expect(waccIssue?.message).toMatch(/total debt is unavailable/);
     });
 
-    it('reports the specific historical-cost-of-debt case for a company with debt but no interest expense (the AAPL scenario) — never fabricates a value, never widens what counts as valid', () => {
+    it('reports the specific historical-cost-of-debt case for a company with debt but no interest expense (the AAPL/NVDA scenario) — never fabricates a value, never widens what counts as valid, and flags it as an analyst-assumption gap rather than a generic failure', () => {
       const wacc = makeWaccResult({
         preTaxCostOfDebt: tag(null, 'calculated'),
         afterTaxCostOfDebt: tag(null, 'calculated'),
@@ -157,10 +157,22 @@ describe('validateDcfInputs', () => {
       });
       const issues = validateDcfInputs(makeHistoricals(), makeMarketData(), makeAssumptions(), null, wacc);
       const waccIssue = issues.find((i) => i.field === 'wacc');
-      expect(waccIssue?.severity).toBe('ERROR'); // still blocking — never marked valid
-      expect(waccIssue?.message).toMatch(/Historical cost of debt is unavailable/);
-      expect(waccIssue?.message).toMatch(/select a manual cost-of-debt assumption/);
+      expect(waccIssue?.severity).toBe('ERROR'); // still blocking — WACC genuinely can't resolve without it
+      expect(waccIssue?.assumptionRequired).toBe(true); // but distinguished from a genuine data-quality failure
+      expect(waccIssue?.message).toMatch(/Analyst assumption required/);
+      expect(waccIssue?.message).toMatch(/historical cost of debt is unavailable/);
+      expect(waccIssue?.message).toMatch(/sourced pre-tax cost-of-debt assumption/);
       expect(waccIssue?.message).not.toMatch(/NonoperatingIncomeExpense|Other income/i); // never references the combined line as a source
+    });
+
+    it('does not mark market-cap-missing or total-debt-missing issues as an analyst assumption — those are genuine data gaps', () => {
+      const marketCapWacc = makeWaccResult({ marketCapitalization: tag(null, 'actual'), equityWeight: tag(null, 'calculated'), debtWeight: tag(null, 'calculated'), wacc: tag(null, 'calculated') });
+      const marketCapIssue = validateDcfInputs(makeHistoricals(), makeMarketData(), makeAssumptions(), null, marketCapWacc).find((i) => i.field === 'wacc');
+      expect(marketCapIssue?.assumptionRequired).toBeFalsy();
+
+      const totalDebtWacc = makeWaccResult({ totalDebt: tag(null, 'actual'), equityWeight: tag(null, 'calculated'), debtWeight: tag(null, 'calculated'), wacc: tag(null, 'calculated') });
+      const totalDebtIssue = validateDcfInputs(makeHistoricals(), makeMarketData(), makeAssumptions(), null, totalDebtWacc).find((i) => i.field === 'wacc');
+      expect(totalDebtIssue?.assumptionRequired).toBeFalsy();
     });
 
     it('does not require cost of debt for a genuinely debt-free company — existing behavior is unaffected', () => {

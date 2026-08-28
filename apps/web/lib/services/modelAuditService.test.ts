@@ -122,6 +122,13 @@ describe('modelAuditService', () => {
       expect(outcome).toBeNull();
     });
 
+    it('returns null rather than throwing when getCompanyOverview fails (a transient provider/DB blip) — so one company failing to audit never takes down the sibling comps/data-quality checks running in the same Promise.all', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Transient Failure Co.' } });
+      vi.mocked(getCompanyOverview).mockRejectedValue(new Error('Connection terminated unexpectedly'));
+
+      await expect(runDcfModelAudit(company.id)).resolves.toBeNull();
+    });
+
     function makePeriodNoInterestExpense(fiscalYear: number, revenue: number, filingDate: string): FinancialPeriodData {
       const period = makePeriod(fiscalYear, revenue, filingDate);
       return { ...period, incomeStatement: { ...period.incomeStatement, interestExpense: null } };
@@ -142,7 +149,7 @@ describe('modelAuditService', () => {
       } as never);
     }
 
-    it('remains blocked (a failing DCF validation: wacc finding) when no override is saved and historical interest expense is unavailable', async () => {
+    it('remains blocked (a failing DCF validation: wacc finding) when no override is saved and historical interest expense is unavailable — reported as MEDIUM (analyst assumption needed), not CRITICAL, since this is real company data hitting a known, expected gap rather than something broken', async () => {
       const company = await db.company.create({ data: { ticker: TICKER, name: 'Cost Of Debt Test Co.' } });
       mockNoInterestExpenseData();
 
@@ -150,7 +157,26 @@ describe('modelAuditService', () => {
       expect(outcome).not.toBeNull();
       const waccFinding = outcome!.findings.find((f) => f.check === 'DCF validation: wacc');
       expect(waccFinding?.passed).toBe(false);
+      expect(waccFinding?.severity).toBe('MEDIUM');
+      expect(waccFinding?.message).toMatch(/Analyst assumption required/);
       expect(outcome!.passed).toBe(false);
+    });
+
+    it('reports a genuinely missing input (e.g. no market cap) as CRITICAL, not MEDIUM — the analyst-assumption downgrade is specific to the cost-of-debt case only', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'No Market Cap Co.' } });
+      vi.mocked(getCompanyOverview).mockResolvedValue({
+        ticker: TICKER, name: 'No Market Cap Co.', exchange: 'NASDAQ', sector: 'Tech', industry: 'Software', country: 'US', logoUrl: null,
+        price: 50, changePercent: 0, marketCap: null, yearHigh: 60, yearLow: 40, beta: 1.1, quoteUpdatedAt: new Date().toISOString(), stale: false,
+      });
+      vi.mocked(getFinancials).mockResolvedValue({
+        ticker: TICKER, periodType: 'annual', stale: false,
+        periods: [makePeriod(2023, 1_800_000_000, '2024-02-01'), makePeriod(2024, 2_000_000_000, '2025-02-01'), makePeriod(2025, 2_200_000_000, '2026-02-01')],
+      } as never);
+
+      const outcome = await runDcfModelAudit(company.id);
+      const waccFinding = outcome!.findings.find((f) => f.check === 'DCF validation: wacc');
+      expect(waccFinding?.passed).toBe(false);
+      expect(waccFinding?.severity).toBe('CRITICAL');
     });
 
     it('uses a saved company-level cost-of-debt override so WACC calculates and the DCF validation: wacc finding no longer fails', async () => {

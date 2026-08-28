@@ -90,7 +90,14 @@ export function checkDcfOwnValidation(result: DcfResult): IntegrityFinding[] {
     .filter((issue) => issue.severity === 'ERROR')
     .map((issue) => ({
       check: `DCF validation: ${issue.field}`,
-      severity: 'CRITICAL' as const,
+      // A genuinely missing/broken input (no market cap, no total debt, no
+      // cost of equity) is CRITICAL — the platform is missing something it
+      // should have. An analyst-assumption gap (a real company whose latest
+      // filing just doesn't disclose interest expense) is a real, expected,
+      // and common situation, not a data-quality failure — MEDIUM keeps it
+      // visible without misrepresenting a normal case as the model being
+      // broken. See ValidationIssue.assumptionRequired's doc comment.
+      severity: issue.assumptionRequired ? ('MEDIUM' as const) : ('CRITICAL' as const),
       passed: false,
       message: issue.message,
     }));

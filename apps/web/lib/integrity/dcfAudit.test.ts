@@ -112,6 +112,30 @@ describe('checkDcfOwnValidation', () => {
     expect(waccFinding!.message).toMatch(/not an independent verification/);
   });
 
+  it('maps an analyst-assumption-required wacc issue to MEDIUM, not CRITICAL — a company whose filing just doesn\'t disclose interest expense is not "broken"', () => {
+    const result = makeResult({
+      isValid: false,
+      wacc: { ...makeResult().wacc, wacc: tag(null, 'calculated') },
+      issues: [{ severity: 'ERROR', field: 'wacc', message: 'Analyst assumption required — historical cost of debt is unavailable...', assumptionRequired: true }],
+    });
+    const findings = checkDcfOwnValidation(result);
+    const waccFinding = findings.find((f) => f.check === 'DCF validation: wacc');
+    expect(waccFinding?.passed).toBe(false);
+    expect(waccFinding?.severity).toBe('MEDIUM');
+  });
+
+  it('still maps a genuine missing-input wacc issue (no assumptionRequired flag) to CRITICAL', () => {
+    const result = makeResult({
+      isValid: false,
+      wacc: { ...makeResult().wacc, marketCapitalization: tag(null, 'actual'), wacc: tag(null, 'calculated') },
+      issues: [{ severity: 'ERROR', field: 'wacc', message: 'WACC could not be calculated — market capitalization is unavailable.' }],
+    });
+    const findings = checkDcfOwnValidation(result);
+    const waccFinding = findings.find((f) => f.check === 'DCF validation: wacc');
+    expect(waccFinding?.passed).toBe(false);
+    expect(waccFinding?.severity).toBe('CRITICAL');
+  });
+
   it('never emits both a passing and a failing wacc finding at once', () => {
     const result = makeResult({ isValid: false, issues: [{ severity: 'ERROR', field: 'wacc', message: 'WACC must be positive.' }] });
     const findings = checkDcfOwnValidation(result).filter((f) => f.check === 'DCF validation: wacc');

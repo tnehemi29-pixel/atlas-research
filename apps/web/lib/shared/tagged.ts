@@ -30,4 +30,17 @@ export interface ValidationIssue {
   severity: ValidationSeverity;
   field: string;
   message: string;
+  /**
+   * True for the one specific case where the model can't produce a number
+   * not because data is broken, but because a value only an analyst can
+   * supply is missing (e.g. a company whose recent filings don't separately
+   * disclose interest expense, so a historical cost of debt can't be
+   * calculated). Still ERROR-severity — the DCF genuinely can't resolve
+   * without it — but this distinguishes "needs an analyst's sourced
+   * assumption" from "something is actually wrong with the data," so a
+   * consumer (the valuation page's banner, Research Integrity's severity)
+   * can present the two differently instead of treating every ERROR as an
+   * equally alarming failure. Absent/false for every other issue.
+   */
+  assumptionRequired?: boolean;
 }

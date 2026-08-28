@@ -25,7 +25,14 @@ async function makeCompany(overrides: { price?: number | null; marketCap?: numbe
 async function makePeriod(
   companyId: string,
   fiscalYear: number,
-  overrides: { revenue?: number | null; totalAssets?: number | null; cashAndEquivalents?: number | null; filingDate?: Date } = {},
+  overrides: {
+    revenue?: number | null;
+    totalAssets?: number | null;
+    cashAndEquivalents?: number | null;
+    filingDate?: Date;
+    basicSharesOutstanding?: number | null;
+    dilutedSharesOutstanding?: number | null;
+  } = {},
 ) {
   const revenue = overrides.revenue ?? 500_000_000;
   return db.financialPeriod.create({
@@ -49,7 +56,13 @@ async function makePeriod(
           grossProfit: revenue * 0.6,
           operatingExpenses: revenue * 0.2,
           operatingIncome: revenue * 0.4,
-          dilutedSharesOutstanding: 10_000_000,
+          // Kept equal by default so every existing test's 100 x 10M = $1B
+          // expectation is unaffected by which of the two fields the
+          // reconciliation actually reads — see the dedicated
+          // "uses basic, not diluted" test below for a fixture where they
+          // deliberately differ.
+          basicSharesOutstanding: overrides.basicSharesOutstanding === undefined ? 10_000_000 : overrides.basicSharesOutstanding,
+          dilutedSharesOutstanding: overrides.dilutedSharesOutstanding === undefined ? 10_000_000 : overrides.dilutedSharesOutstanding,
         },
       },
       balanceSheet: {
@@ -127,6 +140,27 @@ describe('dataQualityService', () => {
     // covers that directly).
     const company = await makeCompany({ price: 100, marketCap: 5_000_000_000, quoteUpdatedAt: new Date('2026-02-10') }); // should be ~1B
     await makePeriod(company.id, 2025);
+
+    const outcomes = await runDataQualityChecks(company.id);
+    const marketCapCheck = outcomes.find((o) => o.detail.includes('Market cap'));
+    expect(marketCapCheck?.passed).toBe(false);
+  });
+
+  it('reconciles market cap using basic shares outstanding, not diluted weighted-average shares (diluted is an EPS denominator and overstates the true share count)', async () => {
+    // price x basic (100 x 10M = $1B) matches marketCap exactly; diluted is
+    // deliberately set much higher (as real dilutive RSUs/options would) —
+    // if the check were still reading diluted, this would incorrectly fail.
+    const company = await makeCompany({ price: 100, marketCap: 1_000_000_000, quoteUpdatedAt: new Date('2026-02-10') });
+    await makePeriod(company.id, 2025, { basicSharesOutstanding: 10_000_000, dilutedSharesOutstanding: 10_800_000 });
+
+    const outcomes = await runDataQualityChecks(company.id);
+    const marketCapCheck = outcomes.find((o) => o.detail.includes('Market cap'));
+    expect(marketCapCheck?.passed).toBe(true);
+  });
+
+  it('still produces a genuine market-cap finding when the reported market cap is actually wrong relative to basic shares', async () => {
+    const company = await makeCompany({ price: 100, marketCap: 5_000_000_000, quoteUpdatedAt: new Date('2026-02-10') }); // basic-share expectation is ~1B
+    await makePeriod(company.id, 2025, { basicSharesOutstanding: 10_000_000, dilutedSharesOutstanding: 10_000_000 });
 
     const outcomes = await runDataQualityChecks(company.id);
     const marketCapCheck = outcomes.find((o) => o.detail.includes('Market cap'));

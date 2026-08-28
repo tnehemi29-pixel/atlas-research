@@ -33,3 +33,21 @@ export const dbDirect = globalThis.prismaDirectGlobal ?? new PrismaClient({ data
 if (process.env.NODE_ENV !== 'production') {
   globalThis.prismaDirectGlobal = dbDirect;
 }
+
+/**
+ * Neon's pooled connection endpoint occasionally rejects a query with a
+ * transient connection error under cold starts or pool contention (see the
+ * dbDirect comment above). One retry absorbs that transient case so a
+ * caller only has to handle a genuine, persistent failure — never treat a
+ * failed read as if it were a successful read that just came back empty
+ * (see app/company/[ticker]/valuation/page.tsx for why that distinction
+ * matters: a swallowed error there once looked identical to "no data
+ * saved").
+ */
+export async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch {
+    return fn();
+  }
+}

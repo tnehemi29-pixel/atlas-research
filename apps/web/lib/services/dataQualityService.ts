@@ -145,10 +145,17 @@ export async function runDataQualityChecks(companyId: string): Promise<DataQuali
     }
   }
 
-  // Market data validation (spec section 8).
+  // Market data validation (spec section 8). Market cap is Price × Shares
+  // Outstanding — basic shares, not diluted. Diluted shares outstanding is
+  // an EPS denominator (it adds back the dilutive effect of options/RSUs on
+  // top of the actual outstanding count), so comparing it against a
+  // provider's real market cap systematically overstates "expected" by the
+  // company's dilution — a real, individually-correct number on both sides,
+  // just the wrong one for this comparison. Basic shares outstanding is the
+  // actual share count and the correct basis for this check.
   const marketCapCheck = checkMarketCapReconciliation({
     sharePrice: company.price,
-    sharesOutstanding: latest?.incomeStatement?.dilutedSharesOutstanding ?? null,
+    sharesOutstanding: latest?.incomeStatement?.basicSharesOutstanding ?? null,
     marketCap: company.marketCap,
     quoteUpdatedAt: company.quoteUpdatedAt,
     filingDate: latest?.filingDate ?? null,

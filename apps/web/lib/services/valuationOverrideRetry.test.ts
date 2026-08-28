@@ -3,6 +3,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const findUnique = vi.fn();
 vi.mock('@/lib/db', () => ({
   db: { company: { findUnique: (...args: unknown[]) => findUnique(...args) } },
+  // Mirrors the real lib/db.ts implementation exactly (one retry, then
+  // propagate) — mocked here only so this test doesn't depend on lib/db.ts's
+  // internals, not to change what's actually being exercised.
+  withRetry: async <T>(fn: () => Promise<T>): Promise<T> => {
+    try {
+      return await fn();
+    } catch {
+      return fn();
+    }
+  },
 }));
 
 import { getCostOfDebtOverride } from './valuationOverrideService';

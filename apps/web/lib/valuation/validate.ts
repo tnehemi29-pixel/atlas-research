@@ -8,6 +8,15 @@ const MAX_SANE_PERPETUITY_GROWTH = 0.06; // above long-run GDP/inflation growth 
  * produce a trustworthy number and every downstream value field will be
  * null; WARNING issues are surfaced but don't block computation.
  */
+interface MissingWaccInputsDescription {
+  message: string;
+  /** True only for the "has debt, no disclosed interest expense" case — a
+   * real company with genuine data, where an analyst's sourced assumption
+   * is the missing ingredient, not a sign that something is broken. See
+   * ValidationIssue.assumptionRequired's doc comment for how this is used. */
+  assumptionRequired: boolean;
+}
+
 /** Picks the specific reason WACC is null when the caller has the full
  * breakdown available, rather than the generic catch-all — e.g. "market cap
  * is unavailable" vs. "total debt is unavailable" vs. "this company has debt
@@ -16,17 +25,21 @@ const MAX_SANE_PERPETUITY_GROWTH = 0.06; // above long-run GDP/inflation growth 
  * deciding what to do next. Never fabricates a cause: falls through to the
  * generic message for any combination this doesn't specifically recognize,
  * and never changes whether WACC is valid — only how the failure is worded. */
-function describeMissingWaccInputs(wacc: WaccResult): string {
+function describeMissingWaccInputs(wacc: WaccResult): MissingWaccInputsDescription {
   if (wacc.marketCapitalization.value === null) {
-    return 'WACC could not be calculated — market capitalization is unavailable; provide a value to continue.';
+    return { message: 'WACC could not be calculated — market capitalization is unavailable; provide a value to continue.', assumptionRequired: false };
   }
   if (wacc.totalDebt.value === null) {
-    return 'WACC could not be calculated — total debt is unavailable; provide a value (0 if the company is genuinely debt-free) to continue.';
+    return { message: 'WACC could not be calculated — total debt is unavailable; provide a value (0 if the company is genuinely debt-free) to continue.', assumptionRequired: false };
   }
   if (wacc.debtWeight.value !== null && wacc.debtWeight.value > 0 && wacc.afterTaxCostOfDebt.value === null) {
-    return 'Historical cost of debt is unavailable for this company (interest expense is not broken out in its recent filings) — select a manual cost-of-debt assumption to calculate WACC.';
+    return {
+      message:
+        'Analyst assumption required — historical cost of debt is unavailable in the latest filing (interest expense is not broken out). Enter a sourced pre-tax cost-of-debt assumption to complete WACC.',
+      assumptionRequired: true,
+    };
   }
-  return 'WACC could not be calculated — check that market cap, total debt, and cost of equity/debt inputs are all provided.';
+  return { message: 'WACC could not be calculated — check that market cap, total debt, and cost of equity/debt inputs are all provided.', assumptionRequired: false };
 }
 
 export function validateDcfInputs(
@@ -83,12 +96,14 @@ export function validateDcfInputs(
   }
 
   if (waccValue === null) {
+    const description = wacc
+      ? describeMissingWaccInputs(wacc)
+      : { message: 'WACC could not be calculated — check that market cap, total debt, and cost of equity/debt inputs are all provided.', assumptionRequired: false };
     issues.push({
       severity: 'ERROR',
       field: 'wacc',
-      message: wacc
-        ? describeMissingWaccInputs(wacc)
-        : 'WACC could not be calculated — check that market cap, total debt, and cost of equity/debt inputs are all provided.',
+      message: description.message,
+      assumptionRequired: description.assumptionRequired,
     });
   } else if (waccValue <= 0) {
     issues.push({ severity: 'ERROR', field: 'wacc', message: 'WACC must be positive.' });

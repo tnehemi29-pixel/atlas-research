@@ -1,5 +1,5 @@
 import { Prisma, type IntegrityDatasetType, type ModelAudit } from '@prisma/client';
-import { db } from '@/lib/db';
+import { db, withRetry } from '@/lib/db';
 import { getCompanyOverview } from '@/lib/services/companyService';
 import { getFinancials } from '@/lib/services/financialDataService';
 import { deriveHistoricalYears } from '@/lib/valuation/historicals';
@@ -48,10 +48,19 @@ async function persistModelAudit(companyId: string, modelType: IntegrityDatasetT
  * overview or no financial periods) — never audits a model that couldn't
  * actually be built. */
 export async function runDcfModelAudit(companyId: string): Promise<ModelAuditOutcome | null> {
-  const company = await db.company.findUnique({ where: { id: companyId } });
+  const company = await withRetry(() => db.company.findUnique({ where: { id: companyId } }));
   if (!company) return null;
 
-  const overview = await getCompanyOverview(company.ticker);
+  // getCompanyOverview can throw for a transient provider/DB blip (see its
+  // own doc comment) — treated the same as "couldn't build a DCF to audit
+  // right now" rather than letting it propagate and take down the sibling
+  // comps/data-quality checks running in the same Promise.all.
+  let overview;
+  try {
+    overview = await getCompanyOverview(company.ticker);
+  } catch {
+    return null;
+  }
   if (!overview) return null;
 
   let periods;
@@ -85,7 +94,7 @@ export async function runDcfModelAudit(companyId: string): Promise<ModelAuditOut
 /** Returns null when no peer set could be assembled at all (never audits an
  * empty comps run as if it were a real one). */
 export async function runCompsModelAudit(companyId: string): Promise<ModelAuditOutcome | null> {
-  const company = await db.company.findUnique({ where: { id: companyId } });
+  const company = await withRetry(() => db.company.findUnique({ where: { id: companyId } }));
   if (!company) return null;
 
   const candidates = await getPeerCandidates(company.ticker).catch(() => []);
