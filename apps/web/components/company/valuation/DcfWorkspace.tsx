@@ -14,6 +14,7 @@ import { formatMultiple, formatRatioAsPercent } from '@/lib/utils/format';
 import { clearCostOfDebtOverride, saveCostOfDebtOverride } from '@/lib/api/valuationOverride';
 import { ValuationHeader } from './ValuationHeader';
 import { ValidationIssues } from './ValidationIssues';
+import { StaleFinancialDataWarning } from './StaleFinancialDataWarning';
 import { HistoricalPerformanceTable } from './HistoricalPerformanceTable';
 import { ForecastAssumptionsPanel } from './ForecastAssumptionsPanel';
 import { WaccPanel } from './WaccPanel';
@@ -112,6 +113,7 @@ export function DcfWorkspace({ ticker, overview, financials, savedCostOfDebtOver
 
       <ValuationHeader overview={overview} result={result} />
       <ValidationIssues issues={result.issues} />
+      <StaleFinancialDataWarning stale={financials.stale} dataAsOf={financials.dataAsOf} />
 
       <HistoricalPerformanceTable historicals={historicals} />
 
