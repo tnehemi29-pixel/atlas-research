@@ -132,7 +132,49 @@ describe('integrityIssueService', () => {
       expect(issues[0]!.status).toBe('OPEN'); // never resolved, never reopened — it was already open
       expect(issues[0]!.description).toMatch(/Historical cost of debt is unavailable/);
       expect(issues[0]!.category).toBe('DCF_MODEL_ERROR'); // unchanged
-      expect(issues[0]!.severity).toBe('MEDIUM'); // unchanged — makeFinding's default, never rewritten by this path
+      expect(issues[0]!.severity).toBe('MEDIUM'); // unchanged here because both findings use makeFinding's same default severity — see the dedicated severity-refresh test below for the case where it actually differs
+    });
+
+    it('also updates severity on an OPEN issue when the same dedupeKey\'s classification changes (e.g. a reclassification from "every WACC failure is CRITICAL" to "an analyst-assumption gap is MEDIUM") — the issue must never display a different severity than the dimension summary computed from the same, current finding', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [
+        makeFinding({ category: 'DCF_MODEL_ERROR', severity: 'CRITICAL', dedupeKey: 'dcf:DCF validation: wacc', description: 'WACC could not be calculated — check that market cap, total debt, and cost of equity/debt inputs are all provided.' }),
+      ]);
+
+      const result = await syncIssuesFromFindings(company.id, [
+        makeFinding({ category: 'DCF_MODEL_ERROR', severity: 'MEDIUM', dedupeKey: 'dcf:DCF validation: wacc', description: 'Analyst assumption required — historical cost of debt is unavailable in the latest filing (interest expense is not broken out). Enter a sourced pre-tax cost-of-debt assumption to complete WACC.' }),
+      ]);
+      expect(result.descriptionUpdated).toBe(1);
+      expect(result.created).toBe(0);
+      expect(result.autoResolved).toBe(0);
+
+      const issues = await listIntegrityIssues(company.id, { status: 'OPEN' });
+      expect(issues).toHaveLength(1);
+      expect(issues[0]!.status).toBe('OPEN'); // never resolved, never reopened
+      expect(issues[0]!.severity).toBe('MEDIUM'); // rewritten to match the current, real classification
+      expect(issues[0]!.description).toMatch(/Analyst assumption required/);
+    });
+
+    it('does not write anything when neither description nor severity changed — no unnecessary update', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeFinding({ dedupeKey: 'dcf:no-change', severity: 'MEDIUM', description: 'same message every time' })]);
+
+      const result = await syncIssuesFromFindings(company.id, [makeFinding({ dedupeKey: 'dcf:no-change', severity: 'MEDIUM', description: 'same message every time' })]);
+      expect(result.descriptionUpdated).toBe(0);
+      expect(result.created).toBe(0);
+    });
+
+    it('never rewrites severity on a RESOLVED or IGNORED issue when the same problem recurs with a different severity', async () => {
+      const company = await db.company.create({ data: { ticker: TICKER, name: 'Integrity Issue Test Co.' } });
+      await syncIssuesFromFindings(company.id, [makeFinding({ category: 'FINANCIAL_RECONCILIATION', severity: 'HIGH', dedupeKey: 'dcf:resolved-severity-case', description: 'old message' })]);
+      const created = (await listIntegrityIssues(company.id))[0]!;
+      await resolveIntegrityIssue(created.id, 'user-1', 'Confirmed a data-provider rounding difference.');
+
+      await syncIssuesFromFindings(company.id, [makeFinding({ category: 'FINANCIAL_RECONCILIATION', severity: 'LOW', dedupeKey: 'dcf:resolved-severity-case', description: 'new message, still failing' })]);
+
+      const issue = await getIntegrityIssue(created.id);
+      expect(issue.status).toBe('RESOLVED'); // never reopened
+      expect(issue.severity).toBe('HIGH'); // never rewritten
     });
 
     it('updates the description of an ACKNOWLEDGED issue the same way — status remains ACKNOWLEDGED', async () => {

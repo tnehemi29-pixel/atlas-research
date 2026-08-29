@@ -100,11 +100,13 @@ export interface SyncIssuesResult {
    * and passed." */
   autoClosedUnverifiable: number;
   /** An existing OPEN/ACKNOWLEDGED issue for the same still-failing finding
-   * whose description text changed (e.g. a validation message became more
-   * specific) — only `description` is rewritten; status, detectedAt,
-   * category, severity, and dedupeKey are all left exactly as they were.
-   * Never fires for RESOLVED/IGNORED issues, and never fires when the text
-   * is unchanged (no unnecessary write). */
+   * whose description and/or severity changed (e.g. a validation message
+   * became more specific, or a reclassification like "every WACC failure is
+   * CRITICAL" -> "an analyst-assumption gap is MEDIUM" changed how this
+   * exact, still-open detection is scored) — only `description`/`severity`
+   * are rewritten; status, detectedAt, category, and dedupeKey are all left
+   * exactly as they were. Never fires for RESOLVED/IGNORED issues, and never
+   * fires when neither field changed (no unnecessary write). */
   descriptionUpdated: number;
   /** An issue previously auto-resolved via AUTO_RESOLVABLE_FINDING_KEYS,
    * reopened because the same exact finding is failing again — see the
@@ -166,24 +168,45 @@ export async function syncIssuesFromFindings(companyId: string, findings: Findin
         });
         created += 1;
         await writeAuditLogEntry({ companyId, entityType: 'ResearchIntegrityIssue', entityId: issue.id, action: 'ISSUE_CREATED', detail: { category: finding.category, severity: finding.severity, description: finding.description } });
-      } else if ((existing.status === 'OPEN' || existing.status === 'ACKNOWLEDGED') && existing.description !== finding.description) {
-        // Same finding, still failing, still OPEN/ACKNOWLEDGED — only its
-        // description text changed (e.g. a validation message became more
-        // specific about which input is actually missing). Status,
-        // detectedAt, category, severity, and dedupeKey are all left exactly
-        // as they were; this is the same detection, not a new one, and it
-        // must stay OPEN because the underlying problem is still real and
-        // unresolved. A RESOLVED/IGNORED issue is never touched here — the
-        // status check above excludes it, same as the rest of this file's
-        // "never silently reopen or rewrite" discipline.
-        await db.researchIntegrityIssue.update({ where: { id: existing.id }, data: { description: finding.description } });
+      } else if (
+        (existing.status === 'OPEN' || existing.status === 'ACKNOWLEDGED') &&
+        (existing.description !== finding.description || existing.severity !== finding.severity)
+      ) {
+        // Same finding (same dedupeKey), still failing, still OPEN/
+        // ACKNOWLEDGED — its description and/or severity changed because
+        // Atlas's own classification of it changed (e.g. a validation
+        // message became more specific, or a check that used to treat every
+        // failure as CRITICAL now distinguishes a genuine data-quality
+        // failure from one that only needs an analyst's assumption). Status,
+        // detectedAt, category, and dedupeKey are still left exactly as they
+        // were — this is the same detection, not a new one, and it must stay
+        // OPEN because the underlying problem is still real and unresolved.
+        // Severity IS updated here (unlike description alone, previously):
+        // leaving a stale severity behind after a legitimate reclassification
+        // produces a literal contradiction (the same issue reading CRITICAL
+        // in its own row while the dimension summary computed fresh from the
+        // same finding reads MEDIUM) — that's worse than the narrow
+        // "never silently reopen or rewrite" discipline this guards against,
+        // which is about not fabricating a *different* detection, not about
+        // freezing a stale label on the same one. A RESOLVED/IGNORED issue is
+        // never touched here — the status check above excludes it.
+        await db.researchIntegrityIssue.update({
+          where: { id: existing.id },
+          data: { description: finding.description, severity: finding.severity },
+        });
         descriptionUpdated += 1;
         await writeAuditLogEntry({
           companyId,
           entityType: 'ResearchIntegrityIssue',
           entityId: existing.id,
           action: 'CHECK_RUN',
-          detail: { reason: 'description-refreshed', previousDescription: existing.description, newDescription: finding.description },
+          detail: {
+            reason: 'description-refreshed',
+            previousDescription: existing.description,
+            newDescription: finding.description,
+            previousSeverity: existing.severity,
+            newSeverity: finding.severity,
+          },
         });
       } else if (
         existing.status === 'RESOLVED' &&
