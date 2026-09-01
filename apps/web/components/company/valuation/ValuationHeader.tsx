@@ -7,10 +7,46 @@ interface ValuationHeaderProps {
   result: DcfResult;
 }
 
+export type ModelStatusTone = 'valid' | 'needs-input' | 'blocking';
+
+export interface ModelStatusView {
+  label: string;
+  tone: ModelStatusTone;
+}
+
+/**
+ * Distinguishes a genuinely broken/missing input from the one case where the
+ * model just needs an analyst-supplied assumption (see
+ * ValidationIssue.assumptionRequired's doc comment). Without this, the
+ * "Model Status" badge showed the same alarming red "blocking issue(s)" for
+ * both, while ValidationIssues.tsx right below it already presents the
+ * assumption-required case with calmer, blue "Analyst input needed" styling
+ * — two different tones for the same fact on the same page. Extracted as a
+ * plain function, same convention as WaccPanel.tsx's
+ * resolveCostOfDebtStatusView, since this codebase has no React Testing
+ * Library to exercise the rendered badge directly.
+ */
+export function resolveModelStatusView(result: DcfResult): ModelStatusView {
+  if (result.isValid) return { label: 'Valid', tone: 'valid' };
+
+  const errorIssues = result.issues.filter((i) => i.severity === 'ERROR');
+  const onlyNeedsAnalystInput = errorIssues.length > 0 && errorIssues.every((i) => i.assumptionRequired);
+  if (onlyNeedsAnalystInput) return { label: 'Needs analyst input', tone: 'needs-input' };
+
+  return { label: `${errorIssues.length} blocking issue(s)`, tone: 'blocking' };
+}
+
+const MODEL_STATUS_TEXT_CLASS: Record<ModelStatusTone, string> = {
+  valid: 'text-emerald-700',
+  'needs-input': 'text-blue-700',
+  blocking: 'text-red-700',
+};
+
 export function ValuationHeader({ overview, result }: ValuationHeaderProps) {
   const upsideValue = result.upsideDownside;
   const upsidePercent = upsideValue === null ? null : upsideValue * 100;
   const isPositive = upsidePercent !== null && upsidePercent >= 0;
+  const modelStatus = resolveModelStatusView(result);
 
   return (
     <header className="border-ink/10 border-b pb-6">
@@ -55,9 +91,7 @@ export function ValuationHeader({ overview, result }: ValuationHeaderProps) {
 
         <div className="border-ink/10 bg-paper rounded-xl border p-4">
           <div className="text-ink/40 text-xs uppercase tracking-wide">Model Status</div>
-          <div className={`mt-1 text-sm font-medium ${result.isValid ? 'text-emerald-700' : 'text-red-700'}`}>
-            {result.isValid ? 'Valid' : `${result.issues.filter((i) => i.severity === 'ERROR').length} blocking issue(s)`}
-          </div>
+          <div className={`mt-1 text-sm font-medium ${MODEL_STATUS_TEXT_CLASS[modelStatus.tone]}`}>{modelStatus.label}</div>
         </div>
       </div>
 
