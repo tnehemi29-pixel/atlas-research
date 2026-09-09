@@ -7,7 +7,7 @@ import {
   clearCostOfDebtOverride,
   saveCostOfDebtOverride,
 } from '@/lib/services/valuationOverrideService';
-import { computeIntegritySnapshot } from '@/lib/services/integritySnapshotService';
+import { getCompanyIntegritySnapshot } from '@/lib/services/integritySnapshotService';
 
 export const dynamic = 'force-dynamic';
 
@@ -22,11 +22,25 @@ export const dynamic = 'force-dynamic';
  * transient failure here must never turn a successful override save into an
  * error response — the override itself is the operation that matters; this
  * is just keeping the cached snapshot from lagging behind it.
+ *
+ * Goes through getCompanyIntegritySnapshot's own claim/lease machinery
+ * (forceRefresh: true) rather than calling computeIntegritySnapshot()
+ * directly — a prior version of this function called it unclaimed, which
+ * let a cost-of-debt save race, uncoordinated, against a concurrent
+ * getCompanyIntegritySnapshot() computation and silently lose or clobber
+ * whichever finished last. forceRefresh is the right mode here, not the
+ * default cache-serving one: this call needs a genuinely fresh result, not
+ * a stale-while-revalidate read, so it waits for an in-flight computation
+ * (whoever owns it) rather than returning early, and only reclaims once
+ * that computation's lease has actually expired — it never computes
+ * unclaimed and never releases a claim it doesn't own, exactly like every
+ * other caller of this function. No new locking mechanism, no change to
+ * computeIntegritySnapshot() itself.
  */
 async function refreshIntegritySnapshot(ticker: string): Promise<void> {
   try {
     const company = await db.company.findUnique({ where: { ticker: ticker.trim().toUpperCase() }, select: { id: true } });
-    if (company) await computeIntegritySnapshot(company.id);
+    if (company) await getCompanyIntegritySnapshot(company.id, { forceRefresh: true });
   } catch {
     // Best-effort — the override save/clear above already succeeded and is
     // the source of truth; the next TTL expiry or manual Refresh will catch

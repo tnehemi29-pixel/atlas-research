@@ -9,13 +9,13 @@ vi.mock('@/lib/services/valuationOverrideService', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/services/valuationOverrideService')>();
   return { ...actual, saveCostOfDebtOverride: vi.fn(), clearCostOfDebtOverride: vi.fn() };
 });
-vi.mock('@/lib/services/integritySnapshotService', () => ({ computeIntegritySnapshot: vi.fn() }));
+vi.mock('@/lib/services/integritySnapshotService', () => ({ getCompanyIntegritySnapshot: vi.fn() }));
 vi.mock('@/lib/db', () => ({ db: { company: { findUnique: vi.fn() } } }));
 
 import { DELETE, PUT } from './route';
 import { requireUser } from '@/lib/auth/requireUser';
 import { CompanyNotFoundError, InvalidCostOfDebtOverrideError, clearCostOfDebtOverride, saveCostOfDebtOverride } from '@/lib/services/valuationOverrideService';
-import { computeIntegritySnapshot } from '@/lib/services/integritySnapshotService';
+import { getCompanyIntegritySnapshot } from '@/lib/services/integritySnapshotService';
 import { db } from '@/lib/db';
 
 function makeRequest(url: string, body?: unknown): NextRequest {
@@ -40,14 +40,14 @@ describe('PUT/DELETE /api/v1/companies/[ticker]/valuation/cost-of-debt', () => {
     vi.mocked(saveCostOfDebtOverride).mockReset();
     vi.mocked(clearCostOfDebtOverride).mockReset();
     vi.mocked(db.company.findUnique).mockReset();
-    vi.mocked(computeIntegritySnapshot).mockReset();
+    vi.mocked(getCompanyIntegritySnapshot).mockReset();
   });
 
   it('PUT: recomputes the integrity snapshot for this company after a successful save', async () => {
     vi.mocked(requireUser).mockResolvedValue({ id: 'user-1' } as never);
     vi.mocked(saveCostOfDebtOverride).mockResolvedValue(0.0578);
     vi.mocked(db.company.findUnique).mockResolvedValue({ id: 'company-1' } as never);
-    vi.mocked(computeIntegritySnapshot).mockResolvedValue({} as never);
+    vi.mocked(getCompanyIntegritySnapshot).mockResolvedValue({} as never);
 
     const response = await PUT(makeRequest('/api/v1/companies/AAPL/valuation/cost-of-debt', { costOfDebtOverride: 0.0578 }), {
       params: { ticker: 'AAPL' },
@@ -55,26 +55,26 @@ describe('PUT/DELETE /api/v1/companies/[ticker]/valuation/cost-of-debt', () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ costOfDebtOverride: 0.0578 });
-    expect(computeIntegritySnapshot).toHaveBeenCalledWith('company-1');
+    expect(getCompanyIntegritySnapshot).toHaveBeenCalledWith('company-1', { forceRefresh: true });
   });
 
   it('DELETE: recomputes the integrity snapshot for this company after a successful clear', async () => {
     vi.mocked(requireUser).mockResolvedValue({ id: 'user-1' } as never);
     vi.mocked(clearCostOfDebtOverride).mockResolvedValue(undefined);
     vi.mocked(db.company.findUnique).mockResolvedValue({ id: 'company-1' } as never);
-    vi.mocked(computeIntegritySnapshot).mockResolvedValue({} as never);
+    vi.mocked(getCompanyIntegritySnapshot).mockResolvedValue({} as never);
 
     const response = await DELETE(makeRequest('/api/v1/companies/AAPL/valuation/cost-of-debt'), { params: { ticker: 'AAPL' } });
 
     expect(response.status).toBe(200);
-    expect(computeIntegritySnapshot).toHaveBeenCalledWith('company-1');
+    expect(getCompanyIntegritySnapshot).toHaveBeenCalledWith('company-1', { forceRefresh: true });
   });
 
   it('a transient failure recomputing the snapshot never turns a successful save into an error response', async () => {
     vi.mocked(requireUser).mockResolvedValue({ id: 'user-1' } as never);
     vi.mocked(saveCostOfDebtOverride).mockResolvedValue(0.05);
     vi.mocked(db.company.findUnique).mockResolvedValue({ id: 'company-1' } as never);
-    vi.mocked(computeIntegritySnapshot).mockRejectedValue(new Error('transient DB blip'));
+    vi.mocked(getCompanyIntegritySnapshot).mockRejectedValue(new Error('transient DB blip'));
 
     const response = await PUT(makeRequest('/api/v1/companies/AAPL/valuation/cost-of-debt', { costOfDebtOverride: 0.05 }), {
       params: { ticker: 'AAPL' },
@@ -94,7 +94,7 @@ describe('PUT/DELETE /api/v1/companies/[ticker]/valuation/cost-of-debt', () => {
     });
 
     expect(response.status).toBe(200);
-    expect(computeIntegritySnapshot).not.toHaveBeenCalled();
+    expect(getCompanyIntegritySnapshot).not.toHaveBeenCalled();
   });
 
   it('still maps InvalidCostOfDebtOverrideError to 400 and never attempts a snapshot recompute', async () => {
@@ -106,7 +106,7 @@ describe('PUT/DELETE /api/v1/companies/[ticker]/valuation/cost-of-debt', () => {
     });
 
     expect(response.status).toBe(400);
-    expect(computeIntegritySnapshot).not.toHaveBeenCalled();
+    expect(getCompanyIntegritySnapshot).not.toHaveBeenCalled();
   });
 
   it('still maps CompanyNotFoundError to 404 and never attempts a snapshot recompute', async () => {
@@ -118,6 +118,6 @@ describe('PUT/DELETE /api/v1/companies/[ticker]/valuation/cost-of-debt', () => {
     });
 
     expect(response.status).toBe(404);
-    expect(computeIntegritySnapshot).not.toHaveBeenCalled();
+    expect(getCompanyIntegritySnapshot).not.toHaveBeenCalled();
   });
 });

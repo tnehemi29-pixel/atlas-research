@@ -2213,6 +2213,16 @@ model IntegritySnapshot {
 
   computedAt DateTime @default(now())
 
+  // Set only while a computeIntegritySnapshot() call is actively
+  // recomputing this company's snapshot; cleared in a `finally` once it
+  // finishes (success or failure). Lets getCompanyIntegritySnapshot claim
+  // the right to recompute via one atomic conditional UPDATE instead of
+  // every stale-cache caller racing to recompute and last-write-win the
+  // upsert — see integritySnapshotService.ts's tryClaimSnapshotComputation.
+  // Null for every row that isn't currently being computed, which is the
+  // correct interpretation for every row that already exists today.
+  computingSince DateTime?
+
   @@map("integrity_snapshots")
 }
 
